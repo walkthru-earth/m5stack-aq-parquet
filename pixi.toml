@@ -13,10 +13,18 @@ ports = "python -m serial.tools.list_ports -v"
 chip = "esptool --chip esp32s3 chip-id"
 flash-id = "esptool --chip esp32s3 flash-id"
 mac = "esptool --chip esp32s3 read-mac"
+# Read-only eFuse dump. Confirms flash type, wafer revision and that no
+# secure-boot or flash-encryption fuse has been burned.
+efuse = "espefuse summary"
 # Full 16 MB flash image before the first write. This is the anti-brick step.
-backup = { cmd = "mkdir -p backup && esptool --chip esp32s3 --baud 921600 read-flash 0 0x1000000 backup/cores3-flash-$(date -u +%Y%m%dT%H%M%SZ).bin" }
+# Do NOT add a high --baud here. Measured on CoreS3 over USB-Serial/JTAG, the
+# esptool default read the whole 16 MB in 97 s, while --baud 921600 aborted
+# partway with "Serial data stream stopped, possible serial noise or corruption".
+backup = { cmd = "mkdir -p backup && esptool --chip esp32s3 read-flash 0 0x1000000 backup/cores3-flash-$(date -u +%Y%m%dT%H%M%SZ).bin" }
 # Restore a backup taken above. Destructive, pass the file explicitly.
-restore = "esptool --chip esp32s3 --baud 921600 write-flash 0"
+restore = "esptool --chip esp32s3 write-flash 0"
+# Show the partition table of a saved backup image. Read-only, pass the file.
+backup-partitions = "python tools/read_partitions.py"
 
 # --- host code quality ---
 fmt = "clang-format -i $(git ls-files '*.c' '*.h' '*.cpp' '*.hpp' 2>/dev/null)"
@@ -37,3 +45,9 @@ pip = ">=26.2.1,<27"
 pyserial = ">=3.5,<4"
 cppcheck = ">=2.21.0,<3"
 pre-commit = ">=4.6.2,<5"
+
+[activation.env]
+# Firmware SDKs are large and are not conda packages, so the project bootstraps
+# them itself into one pinned cache that every git worktree shares. Override
+# this to relocate them. Nothing here is ever written inside the repo.
+M5_TOOLCHAIN_ROOT = "$HOME/.cache/m5stack-aq-parquet/toolchains"

@@ -12,5 +12,6 @@ Entry point: root [`AGENTS.md`](../AGENTS.md). It routes here and holds the host
 | Built-in microSD slot, shared SPI, logging, removal/recovery | [Storage](cores3-storage.md) |
 | Any optional Unit, Module, Base, or third-party peripheral | [Add-on integration](addons.md), then its individual reference |
 | Optional M134/PMSA003 air-quality accessory | [Air-quality add-on](addon-air-quality.md) |
+| What was actually measured on our board, versus what is only source-checked | [Bench-verified record](bench-verified.md) |
 
 Maintenance: keep board facts in hardware, core dependency recommendations in development, accessory facts/driver pins in `addon-<name>.md`. Preserve verified wiring, conflicts, protocol edge cases, and source links; use a keyword/link for routine APIs. Record SKU/revision and uncertainty when sources disagree. A release labeled “latest” is a dated observation, not a floating dependency pin. If an M5 CDN link fails, resolve the resource again through its linked product page.

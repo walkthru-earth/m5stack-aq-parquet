@@ -19,7 +19,7 @@ pixi run backup    # full flash image before the first write
 
 Read the "Do not brick the board" section of `AGENTS.md` before flashing anything.
 
-The ESP32-S3 cross-compiler is not managed by pixi. Install ESP-IDF separately, see `docs/cores3-development.md`.
+Firmware SDKs are not conda packages, so the project fetches them itself at pinned versions. A clean machine needs `pixi install` and then the setup task for whichever trial you are building, with no manual SDK installation. SDKs land in `$M5_TOOLCHAIN_ROOT`, default `~/.cache/m5stack-aq-parquet/toolchains`, deliberately outside the repo so git worktrees share one copy. See `docs/cores3-development.md`.
 
 ## Hardware
 

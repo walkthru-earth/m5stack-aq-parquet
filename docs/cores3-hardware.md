@@ -1,6 +1,6 @@
 # CoreS3 hardware: pins, ownership, power
 
-Read when wiring, allocating peripherals, debugging boot, or changing power/sleep. Retrieval snapshot: **2026-09-06**; schematic v1.0, M5Unified 0.2.21, M5GFX 0.2.28. Source inspection only; no physical-board verification.
+Read when wiring, allocating peripherals, debugging boot, or changing power/sleep. Retrieval snapshot: **2026-09-06**; schematic v1.0, M5Unified 0.2.21, M5GFX 0.2.28. Source inspection unless stated otherwise. Facts confirmed on a real board, including chip revision, flash size and flash mode, live in [bench-verified](bench-verified.md), which overrides this file where they disagree.
 
 ## Identify the board first
 
@@ -82,6 +82,7 @@ Serialize complete read-modify-write operations: an unrelated whole-port write c
 - **Camera:** GC0308 has no native JPEG output; choose RGB565/YUV/grayscale, begin with one small framebuffer, return every `camera_fb_t`. VGA RGB565 alone is 614,400 bytes; PSRAM bandwidth competes with Wi-Fi. Reuse the internal SCCB bus and perform PMIC/expander initialization first. [Camera driver constraints][camera]
 - **Candidate expansion pins:** 5/6/7/10 first; 1/2,8/9,17/18 only when their ports are unused. GPIO1–10 are ADC1; 11–20 ADC2. Recheck physical stack occupancy before assigning LEDC/RMT/UART/SPI by GPIO matrix. `gpio_dump_io_configuration` exposes accidental ownership changes. [GPIO reference][gpio]
 - **Boot/debug:** straps **0,3,45,46** already have board functions; do not add pulls/drivers that change reset levels. Camera occupies external JTAG pins39–42; USB Serial/JTAG uses19/20. Native USB-OTG and Serial/JTAG share the internal PHY: inspect the USB-mode configuration before expecting both simultaneously. [SoC datasheet][soc]
+- **eFuse says nothing about PSRAM here:** `PSRAM_CAP`, `PSRAM_VENDOR` and the derived `PSRAM_CAPACITY` all read zero on a measured CoreS3, because those fuses describe in-package PSRAM and this board carries its 8 MB Quad PSRAM as a separate part. A zero reading is not an absent-PSRAM finding. Confirm size at runtime instead, and treat a runtime zero as a Quad-versus-Octal build error. [Measured](bench-verified.md)
 - **Recovery:** hold RST ~3 s until green LED, then release for download mode. Avoid unbounded `while (!Serial)` in unattended firmware. [Board recovery][board]
 
 ## Power and sleep

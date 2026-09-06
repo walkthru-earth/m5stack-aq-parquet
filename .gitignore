@@ -4,5 +4,11 @@
 backup/
 
 # local agent / tooling state
-.claude/settings.local.json
+# Agent git worktrees are created under .claude/worktrees, so ignore the lot.
+.claude/
 .code-review-graph/
+
+# Firmware SDKs live in $M5_TOOLCHAIN_ROOT outside the repo, but ignore these
+# defensively in case a tool ever writes one here.
+.toolchains/
+
