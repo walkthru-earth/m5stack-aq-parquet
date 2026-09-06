@@ -1,0 +1,8 @@
+# pixi environments
+.pixi/*
+!.pixi/config.toml
+backup/
+
+# local agent / tooling state
+.claude/settings.local.json
+.code-review-graph/

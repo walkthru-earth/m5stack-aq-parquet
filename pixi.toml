@@ -1,0 +1,39 @@
+[workspace]
+authors = ["Youssef Harby <yharby@walkthru.earth>"]
+channels = ["conda-forge"]
+name = "m5stack-aq-parquet"
+platforms = ["osx-arm64"]
+version = "0.1.0"
+
+[tasks]
+# --- device safety, read-only unless named otherwise ---
+# Which serial ports exist. Run before anything that touches the board.
+ports = "python -m serial.tools.list_ports -v"
+# Confirm you are talking to an ESP32-S3 and not another board. Read-only.
+chip = "esptool --chip esp32s3 chip-id"
+flash-id = "esptool --chip esp32s3 flash-id"
+mac = "esptool --chip esp32s3 read-mac"
+# Full 16 MB flash image before the first write. This is the anti-brick step.
+backup = { cmd = "mkdir -p backup && esptool --chip esp32s3 --baud 921600 read-flash 0 0x1000000 backup/cores3-flash-$(date -u +%Y%m%dT%H%M%SZ).bin" }
+# Restore a backup taken above. Destructive, pass the file explicitly.
+restore = "esptool --chip esp32s3 --baud 921600 write-flash 0"
+
+# --- host code quality ---
+fmt = "clang-format -i $(git ls-files '*.c' '*.h' '*.cpp' '*.hpp' 2>/dev/null)"
+fmt-check = "clang-format --dry-run --Werror $(git ls-files '*.c' '*.h' '*.cpp' '*.hpp' 2>/dev/null)"
+lint = "cppcheck --enable=warning,style,performance,portability --inline-suppr --error-exitcode=1 --std=c++23 firmware"
+hooks = "pre-commit install"
+
+[dependencies]
+cmake = ">=4.4.3,<5"
+ninja = ">=1.13.2,<2"
+ccache = ">=4.14,<5"
+python = ">=3.14.7,<3.15"
+git = ">=2.55.0,<3"
+esptool = ">=5.3.1,<6"
+rust = ">=1.98.0,<1.99"
+clang-tools = ">=23.1.0,<24"
+pip = ">=26.2.1,<27"
+pyserial = ">=3.5,<4"
+cppcheck = ">=2.21.0,<3"
+pre-commit = ">=4.6.2,<5"
