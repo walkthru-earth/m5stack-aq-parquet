@@ -73,6 +73,12 @@ Further rules.
 - Recovery from a bad image is hold RST about 3 seconds until the green LED, then release for download mode. Verify recovery works before flashing anything that reconfigures power or USB mode.
 - `docs/cores3-hardware.md` covers rail assignments and expander bits. Raw expander writes can reset the screen or reverse the supply path, so use the `M5.Power` API.
 
+## Reading the board back
+
+`pixi run capture --port <port> --seconds <n>` records serial output for a bounded time and stops, so a silent board cannot hang the caller. Add `--out <file>` to keep the log, or `--until "<text>"` to stop early. `pixi run monitor <port> <baud>` is the interactive terminal.
+
+If a capture returns nothing, the board is most likely sitting in the ROM download bootloader, which prints nothing at all. Confirm with `pixi run chip`, which still answers there.
+
 ## Code quality gates
 
 `pixi run fmt`, `pixi run fmt-check`, `pixi run lint` (cppcheck over `firmware/`), `pixi run hooks` to install pre-commit.

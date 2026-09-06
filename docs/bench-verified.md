@@ -38,6 +38,10 @@ Flashing any trial in this repo overwrites that image. Inspect a saved backup wi
 - **Do not force a high baud on this board.** Reading the full 16 MB at the esptool default succeeded in **97 seconds**, about 1382 kbit/s. The same read with `--baud 921600` aborted at roughly 1.8 percent with `Serial data stream stopped, possible serial noise or corruption`, and wrote no file. The transport here is native USB-Serial/JTAG, so the requested baud buys nothing and costs reliability. The `backup` and `restore` tasks therefore pass no `--baud`.
 - **A failed backup can look like success.** The first attempt exited zero because the failure was hidden behind a shell pipeline, while esptool had actually aborted and produced no file. Always confirm `backup/` really contains a 16777216-byte file before flashing anything.
 
+- **A board in download mode is silent, and that is normal.** Held in the ROM download bootloader the board enumerated fine, answered `esptool chip-id` and `flash-id` every time, yet returned zero bytes on the CDC port across two attempts, including after a DTR and RTS reset pulse and a REPL interrupt. No application is running there, so there is nothing to print. Do not read that silence as a failed board. `pixi run capture` reports this case explicitly rather than hanging.
+- **`PIN_POWER_SELECTION` reads `VDD3P3_CPU`.** That is the expected setting for GPIO33 to GPIO37 on a Quad-memory board, and it is consistent with those pins being available to the onboard LCD and microSD circuits rather than consumed by Octal PSRAM.
+- **A first SDK bootstrap costs tens of minutes.** About 1.3 GB downloaded in roughly 20 minutes without either an Arduino or an ESP-IDF toolchain finishing. Run one bootstrap at a time, and do not move the cache mid-download, which restarts transfers already in flight. Sizes are recorded in `firmware/arduino-m5unified/README.md`.
+
 ## PSRAM cannot be confirmed from eFuse on this board
 
 The eFuse block reports `PSRAM_CAP = None`, `PSRAM_VENDOR = None` and the derived `PSRAM_CAPACITY = 0`. **This is not evidence that the board lacks PSRAM.** Those fuses describe PSRAM packaged inside the ESP32-S3 module, and CoreS3 carries its 8 MB Quad PSRAM as a separate part. The only sound check is at runtime from firmware, by reading the detected SPIRAM size.
@@ -54,3 +58,5 @@ Nothing below has been observed on a real board yet. Do not promote any of it in
 - AXP2101 rail states and battery reporting.
 - Whether the optional M134 air-quality module is attached, and any PMSA003 frame.
 - RTC, IMU, touch and display behavior.
+
+Every item above is settled by running the bring-up diagnostic and reading it back with `pixi run capture`. Move a line out of this list and into the table at the top only with an actual measurement and a date.

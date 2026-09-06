@@ -84,6 +84,7 @@ Serialize complete read-modify-write operations: an unrelated whole-port write c
 - **Boot/debug:** straps **0,3,45,46** already have board functions; do not add pulls/drivers that change reset levels. Camera occupies external JTAG pins39–42; USB Serial/JTAG uses19/20. Native USB-OTG and Serial/JTAG share the internal PHY: inspect the USB-mode configuration before expecting both simultaneously. [SoC datasheet][soc]
 - **eFuse says nothing about PSRAM here:** `PSRAM_CAP`, `PSRAM_VENDOR` and the derived `PSRAM_CAPACITY` all read zero on a measured CoreS3, because those fuses describe in-package PSRAM and this board carries its 8 MB Quad PSRAM as a separate part. A zero reading is not an absent-PSRAM finding. Confirm size at runtime instead, and treat a runtime zero as a Quad-versus-Octal build error. [Measured](bench-verified.md)
 - **Recovery:** hold RST ~3 s until green LED, then release for download mode. Avoid unbounded `while (!Serial)` in unattended firmware. [Board recovery][board]
+- **A board in ROM download mode prints nothing.** Measured, a CoreS3 held in download mode enumerates as USB Serial/JTAG and answers `esptool` normally, yet emits not one byte on the CDC port and ignores a REPL interrupt, because no application is running. Silence there is the expected state, not a dead board. `esptool chip-id` succeeding while the port stays quiet is the quickest way to tell the two apart. [Measured](bench-verified.md)
 
 ## Power and sleep
 
