@@ -2,7 +2,7 @@
 
 Air-quality logging firmware for **M5Stack CoreS3 (ESP32-S3)**, writing to Parquet.
 
-The repo holds **multiple parallel framework trials** against the same board, sharing one set of hardware reference docs.
+The repo can hold **more than one framework trial** against the same board, sharing one set of hardware reference docs. It runs one trial at a time, and a second is opened only when a measured result justifies it.
 
 - `AGENTS.md` is the entry point for humans and coding agents.
 - `docs/` holds framework-neutral CoreS3 references (GPIO and power, development stack, wireless, microSD, optional add-ons).

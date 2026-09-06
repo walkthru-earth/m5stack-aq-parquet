@@ -1,7 +1,7 @@
 # AGENTS.md
 
 Firmware project for **M5Stack CoreS3 (ESP32-S3)** in C and/or C++.
-This repo holds **multiple parallel framework trials** against the same board and the same shared reference docs. Sensor modules are optional add-ons, never assumed to be attached.
+This repo can hold **more than one framework trial** against the same board and the same shared reference docs, but it runs **one at a time by default**. Sensor modules are optional add-ons, never assumed to be attached.
 
 ## Repo layout
 
@@ -18,6 +18,7 @@ Trial directory names state the framework first, for example `firmware/idf-cpp/`
 
 ### Rules for trials
 
+0. **One active trial at a time.** Start a second only when a concrete result justifies it, a measured limitation, a driver that does not exist, a performance number that fails a requirement. Never open two trials speculatively to hedge. Parallel trials double the toolchain cost, split attention, and answer a question nobody asked yet. Write down the finding that motivated the new trial in its README, and if you cannot name one, you do not need the trial.
 1. A trial is **self-contained**. Its build files, `sdkconfig.defaults`, partition CSV, dependency lock, and toolchain identity live inside its own directory. Never reach into a sibling trial.
 2. Shared knowledge lives in `docs/`, not duplicated per trial. If a trial discovers a board fact, promote it into the relevant `docs/` file rather than leaving it in one trial's README.
 3. Every trial has a `README.md` recording the framework and pinned version, what the trial is meant to prove, current status (active, parked, or abandoned and why), the build and flash commands, and the date it was last verified on real hardware.
