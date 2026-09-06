@@ -25,6 +25,12 @@ backup = { cmd = "mkdir -p backup && esptool --chip esp32s3 read-flash 0 0x10000
 restore = "esptool --chip esp32s3 write-flash 0"
 # Show the partition table of a saved backup image. Read-only, pass the file.
 backup-partitions = "python tools/read_partitions.py"
+# Read the board's serial output for a bounded time, then stop. Never writes
+# to flash. Pass --port and --seconds, see the script for the full options.
+capture = "python tools/capture_serial.py"
+# Interactive serial terminal. Pass the port and baud, for example
+# pixi run monitor /dev/cu.usbmodem101 115200
+monitor = "python -m serial.tools.miniterm --raw"
 
 # --- host code quality ---
 fmt = "clang-format -i $(git ls-files '*.c' '*.h' '*.cpp' '*.hpp' 2>/dev/null)"
