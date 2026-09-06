@@ -42,7 +42,7 @@ BibTeX.
 
 ```bibtex
 @software{walkthru_m5stack_aq_parquet,
-  author  = {Harby, Youssef},
+  author  = {Youssef Harby, Myagmarjargal Mendbayar},
   title   = {m5stack-aq-parquet: Air-quality logging firmware for M5Stack CoreS3},
   year    = {2026},
   url     = {https://github.com/walkthru-earth/m5stack-aq-parquet},
