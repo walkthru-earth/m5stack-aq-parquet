@@ -13,6 +13,7 @@ Current result: the [active Arduino trial](../firmware/arduino-m5unified/README.
 | Wi-Fi, Bluetooth LE, ESP-NOW, channels and coexistence | [Wireless](cores3-wireless.md) |
 | Built-in microSD slot, shared SPI, logging, removal/recovery | [Storage](cores3-storage.md) |
 | Sensor validity, station identity, clock epochs, Parquet, Hive and future ingestion | [Telemetry pipeline](telemetry-pipeline.md) |
+| Static Iceberg, SensorThings V2 draft, observation mapping and versioned provenance | [Table and observation model](table-and-observation-model.md) |
 | Build/flash, runtime interval/time commands, USB fetch and query examples | [Active trial usage](../firmware/arduino-m5unified/README.md) |
 | Codec comparison, memory budget, identical-row SD tests and benchmark artifacts | [Compression experiment](compression-benchmark.md) |
 | Offline duration, 32 GB capacity assumptions and future object-storage synchronization | [Offline capacity and reconnect plan](telemetry-pipeline.md#offline-capacity-and-reconnection) |
@@ -21,5 +22,7 @@ Current result: the [active Arduino trial](../firmware/arduino-m5unified/README.
 | What was actually measured on our board, versus what is only source-checked | [Bench-verified record](bench-verified.md) |
 
 Maintenance: keep board facts in hardware, core dependency recommendations in development, accessory facts/driver pins in `addon-<name>.md`. Preserve verified wiring, conflicts, protocol edge cases, and source links; use a keyword/link for routine APIs. Record SKU/revision and uncertainty when sources disagree. A release labeled “latest” is a dated observation, not a floating dependency pin. If an M5 CDN link fails, resolve the resource again through its linked product page.
+
+Source and device now use 77-column schema v2. Host tests/build and [short real SD readbacks](bench-verified.md#board-1-schema-v2-provenance-and-timing) pass; full-window/paired-codec numbers still belong to the earlier 73-column image. Do not transfer its size/latency/capacity measurements to the expanded schema.
 
 Do not turn a source audit into a hardware result, a short-file readback into an endurance test, or a software restart into a power-cut test. New claims need a date, firmware/schema identity, method and measured scope; retain prior results under their original image identity.

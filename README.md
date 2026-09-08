@@ -10,7 +10,9 @@ The repo can hold **more than one framework trial** against the same board, shar
 
 ## Current status
 
-As of **2026-09-08**, the only active trial is [Arduino-ESP32 with M5Unified](firmware/arduino-m5unified/README.md), pinned to Arduino-ESP32 3.3.11, M5Unified 0.2.21 and M5GFX 0.2.28. The flashed firmware records one scalar snapshot every **10 seconds**, using a **73-column** schema with explicit nulls/status for unavailable measurements. The PMS display retains its three touch-navigable pages.
+As of **2026-09-08**, the only active trial is [Arduino-ESP32 with M5Unified](firmware/arduino-m5unified/README.md), pinned to Arduino-ESP32 3.3.11, M5Unified 0.2.21 and M5GFX 0.2.28. The flashed firmware records one scalar snapshot every **10 seconds**, using a **77-column** schema with explicit nulls/status for unavailable measurements. The PMS display retains its three touch-navigable pages.
+
+The current revision is **77-column schema v2**, with a SHA-256-identified measurement dictionary, configuration/provenance metadata and four additional timing fields. It is flashed and passed short UNCOMPRESSED/unsynced and LZ4/UTC SD readbacks in both readers; [schema-v2 bench evidence](docs/bench-verified.md#board-1-schema-v2-provenance-and-timing) records hashes and limits. Earlier full-window/compression numbers below remain tied to the 73-column image. [Iceberg/OGC decisions, Mermaid diagrams and contract usage](docs/table-and-observation-model.md) explain the staged design. Iceberg remains host/cloud work; the dictionary does not claim SensorThings API compliance.
 
 An eight-row queue feeds a separate storage task and a bounded PSRAM batch. Default rotation is **15 minutes / up to 90 rows**, configurable to **10 minutes / up to 60 rows** for the running session. The writer emits immutable Parquet without an Arrow runtime, with **UNCOMPRESSED** and opt-in **LZ4_RAW** codecs. Reboot restores uncompressed output. Persistent station identity and UTC-aligned Hive partitions use:
 

@@ -33,6 +33,7 @@ capture = "python tools/capture_serial.py"
 monitor = "python -m serial.tools.miniterm --raw"
 parquet-device = "python tools/parquet_device.py"
 parquet-test = "python tools/test_parquet.py"
+telemetry-contract-test = "python tools/test_telemetry_contract.py"
 
 # --- active firmware trial: Arduino ESP32 + M5Unified ---
 arduino-setup = "firmware/arduino-m5unified/setup.sh"

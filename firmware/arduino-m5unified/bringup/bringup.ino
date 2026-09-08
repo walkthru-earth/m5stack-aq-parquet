@@ -10,6 +10,7 @@
 #include <esp_heap_caps.h>
 #include <esp_mac.h>
 #include <esp_system.h>
+#include <esp_timer.h>
 
 #include <array>
 #include <cstddef>
@@ -136,6 +137,7 @@ PmsFrame latest_pms_frame{};
 bool has_pms_frame = false;
 bool sd_mounted = false;
 std::uint32_t latest_pms_ms = 0;
+std::int64_t latest_pms_mono_us = 0;
 std::uint32_t pms_frame_count = 0;
 std::uint32_t last_display_ms = 0;
 std::uint8_t screen_page = 0;
@@ -389,6 +391,7 @@ bool start_pms() {
           pms_parser.push(static_cast<std::uint8_t>(value), latest_pms_frame)) {
         has_pms_frame = true;
         latest_pms_ms = millis();
+        latest_pms_mono_us = esp_timer_get_time();
         ++pms_frame_count;
         received = true;
         break;
@@ -434,6 +437,7 @@ void poll_pms() {
     }
     has_pms_frame = true;
     latest_pms_ms = millis();
+    latest_pms_mono_us = esp_timer_get_time();
     ++pms_frame_count;
   }
 }
@@ -730,6 +734,7 @@ void loop() {
   telemetry::PmsSnapshot sample;
   sample.present = has_pms_frame;
   sample.age_ms = millis() - latest_pms_ms;
+  sample.received_mono_us = latest_pms_mono_us;
   sample.frames = pms_frame_count;
   sample.checksum_errors = pms_parser.checksum_failures();
   sample.length_errors = pms_parser.length_failures();

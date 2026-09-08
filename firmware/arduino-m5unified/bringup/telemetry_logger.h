@@ -6,6 +6,7 @@ namespace telemetry {
 struct PmsSnapshot {
   std::uint16_t values[12]{};
   std::uint32_t age_ms = 0;
+  std::int64_t received_mono_us = 0;
   std::uint32_t frames = 0;
   std::uint32_t checksum_errors = 0;
   std::uint32_t length_errors = 0;

@@ -38,6 +38,8 @@ Card files use `output/station=<UUID>/year=YYYY/month=MM/day=DD/data_HHMM_<boot>
 
 UTC is supplied explicitly with `pixi run parquet-device sync-time --port <port>` or the bench helper's `--sync-time`; it is a host estimate, not a validated RTC/NTP clock. Until then, files remain under `output/station=<UUID>/unsynced/boot=<boot>/`, with null UTC columns. Subsequent clock updates create a new clock epoch and split the batch without changing previous rows. Object-storage upload, cloud compaction and Iceberg are later work; finalized SD files are retained locally.
 
+The [provenance/time update](table-and-observation-model.md) preserves this lifecycle and path layout, appends four row fields and references a versioned dictionary in each footer. It is flashed and passed short unsynced/UTC SD readbacks in both codecs. Existing files stayed present; larger full-window samples are still needed before updating capacity estimates. [Measured scope](bench-verified.md#board-1-schema-v2-provenance-and-timing)
+
 ### Lessons from the SD run
 
 - Write new files exclusively; a simple `data_0900.parquet` basename would collide after a manual flush, restart or clock correction in the same window. Keep the boot/sequence/attempt suffix and do not append to finalized Parquet. Window/epoch transitions are processed when the next sample reaches the worker, not by a separate wall-clock alarm.

@@ -91,6 +91,29 @@ The following paths describe the **original** build-local artifacts. A later Ard
 
 Separately, **host-only** `pixi run parquet-test --sanitize` passed empty, one-row, 90-row × 96-column and 65,536-row fixtures, including exact integer boundaries, nulls and IEEE float edge cases, with both readers and address/undefined-behavior sanitizers. These tests do not establish device performance or SD failure behavior.
 
+## Board 1, schema v2 provenance and timing
+
+Verified **2026-09-08**, same CoreS3/MAC `44:1b:f6:e2:6b:40` and nominal 32 GB card. Before flashing, a 76-row old-image LZ4 batch (sequences 272–347) was finalized/exported with both readers matching; two subsequent rows (348–349) were flushed to SD immediately before the read-only chip/flash/eFuse checks. The original 16,777,216-byte backup was present. Checks confirmed ESP32-S3 rev0.2, 16 MB Quad flash and unchanged unburned secure-boot/encryption/JTAG-disable fuses. No SD format/delete or eFuse write occurred.
+
+Flashed `arduino-cores3-parquet-v3`, schema `cores3-telemetry-v2`, with application SHA-256 `a239223f55aae798ea3eb0839723ebb96e00e5961808eba1aa522f7d09538b1c`; esptool verified the written hashes. The retained binary is `artifacts/firmware/cores3-parquet-v3-a239223f.bin` (590,032 bytes; compiler program usage 589,887 bytes, static RAM 26,996 bytes). Boot ID `763038f2396a5d68927ac324c4a744a2`; station UUID remained `53315f5f-cb85-4d8d-b623-d56266084189`. Startup enumerated existing files, reported zero partial files, **77 columns**, 696-byte RAM rows and 73,512-byte PSRAM writer allocation. Runtime detected 8 MB PSRAM. `parquet schema` completed with the 77 field definitions and the expected dictionary digest.
+
+| Readback | Result |
+| --- | --- |
+| Unsynchronized, UNCOMPRESSED | 3 rows, sequences 0–2, **9,671 bytes**, footer 6,868 bytes; CRC32 `ec7f0284`; finalization 59,883 µs, sync 12,929 µs |
+| Host-anchored UTC, LZ4_RAW | 4 rows, sequences 3–6, **9,821 bytes**, footer 6,863 bytes; CRC32 `75030cfc`; finalization 97,565 µs, sync 13,048 µs, codec 1,068 µs |
+| Collection timing | Start-to-completion 5,354–5,402 µs across the seven rows; maximum deadline jitter 16,502 µs. Four-row LZ4 cadence 9,995,000–10,015,000 µs |
+| Memory at LZ4 finalization | Heap free 307,996 bytes, minimum 307,160 bytes; PSRAM free 8,279,596 bytes; storage-task free-stack report 5,352 bytes |
+
+Both files passed transfer length/CRC and exact PyArrow/DuckDB value/null comparisons. Additional checks matched all column names against the source dictionary, schema numeric version 2, firmware/configuration metadata, dictionary SHA-256, 900-second rotation and explicit unknown deployment/calibration. Every PMS receipt preceded or equaled snapshot start, which preceded collection completion. The unsynced file kept UTC and both anchors null; its first two rows had warm-up status and null PMS measurements. The anchored file reproduced UTC exactly from each row's anchor pair and belonged to the `2026/09/08/data_2015` UTC window. All seven rows had zero drop, missed-deadline, storage-error and PMS checksum/length-error counters. Unsupported ambient temperature/humidity and battery current stayed null.
+
+Artifacts are git-ignored below the trial directory:
+
+- `artifacts/schema-v2-boot.log`, `artifacts/schema-v2-preflash.log`, `artifacts/schema-v2-unsynced.log`, `artifacts/schema-v2-live.log`.
+- `artifacts/schema-v2-unsynced/station=<UUID>/unsynced/boot=763038f2396a5d68927ac324c4a744a2/data_unsynced_763038f2396a5d68927ac324c4a744a2_0-2-0.parquet`: SHA-256 `e314d217bdcf07aa9045c62d4836fc6e3f2a68043ef0d85aff4dfc5772e6f949`.
+- `artifacts/schema-v2-live/station=<UUID>/year=2026/month=09/day=08/data_2015_763038f2396a5d68927ac324c4a744a2_3-6-1.parquet`: SHA-256 `955a06fc2358cd11008fd517727c43ad8f0186cd819ad19a3451b3b8b5de4ece`.
+
+The logger was left at **900-second rotation / LZ4_RAW**, host UTC restored, with later status `buffered=3 finalized=3 dropped=0 errors=0 queue_peak=1 failed=false`. Codec/time commands are still runtime-only. These are short manually flushed smoke files, not identical-row codec comparisons, full-window qualification, clock-accuracy calibration, OGC conformance or Iceberg validation. Preserve the older 73-column performance/capacity results under their original image; do not infer a new compression ratio from these differently sized batches.
+
 ## Board 1, LZ4 compression
 
 Verified **2026-09-08** with the same pinned Arduino stack, LZ4 1.10.0 (`LZ4_MEMORY_USAGE=12`) and 73-column logger, firmware metadata `arduino-cores3-parquet-v2`. Read-only identity/flash/eFuse checks still showed Board 1, 16 MB Quad flash and unchanged recoverable security state; the original 16 MB backup was present. The pending old-image batch was saved before identity/reset checks. A later flush timed out while no application replied after the safety checks; no success was inferred from that timeout. The new flash completed with hash verification and booted normally.

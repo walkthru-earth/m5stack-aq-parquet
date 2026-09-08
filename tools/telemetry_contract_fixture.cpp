@@ -1,0 +1,93 @@
+#include "../firmware/arduino-m5unified/bringup/lz4_codec.h"
+#include "../firmware/arduino-m5unified/bringup/telemetry_contract.h"
+
+#include <cassert>
+#include <cstdio>
+#include <cstring>
+#include <limits>
+
+using namespace telemetry;
+using namespace telemetry::contract;
+
+namespace {
+bool sink(void *context, const std::uint8_t *bytes, std::size_t count) {
+  return std::fwrite(bytes, 1, count, static_cast<FILE *>(context)) == count;
+}
+} // namespace
+
+int main(int argc, char **argv) {
+  if (argc == 2 && std::strcmp(argv[1], "dictionary") == 0) {
+    std::printf("{\"schema\":\"%s\",\"sha256\":\"%s\",\"fields\":[",
+                kSchemaName, kDictionarySha256);
+    for (std::size_t i = 0; i < field_count; ++i) {
+      const auto &f = kFields[i];
+      // Dictionary tokens are compile-time literals, validated by the host.
+      std::printf("%s{\"name\":\"%s\",\"type\":%u,\"procedure\":\"%s\","
+                  "\"unit\":\"%s\",\"validity\":\"%s\",\"property\":\"%s\"}",
+                  i ? "," : "", f.name, unsigned(f.type), f.procedure, f.unit,
+                  f.validity, f.property_uri);
+    }
+    std::puts("]}");
+    return 0;
+  }
+  if (argc != 4)
+    return 2;
+  const bool compressed = std::strcmp(argv[2], "lz4") == 0;
+  const bool anchored = std::strcmp(argv[3], "anchored") == 0;
+  Sample rows[90]{};
+  Column columns[field_count]{};
+  Workspace workspace{};
+  Lz4Workspace lz4{};
+  const auto compression = lz4.configuration();
+  for (std::size_t i = 0; i < 90; ++i) {
+    auto &row = rows[i];
+    const auto now = std::int64_t(20000000 + i * 10000000);
+    row.integer(schema_version, kSchemaVersion);
+    row.counter(sequence, i);
+    row.counter(monotonic_us, now);
+    row.counter(scheduled_us, now - 123);
+    row.counter(sample_jitter_us, 123);
+    apply_clock(row, now, 15000000, 1788890000000000000LL, anchored ? 1 : 0);
+    row.counter(collection_completed_mono_us, now + 1234);
+    if (i > 0) {
+      row.counter(pms_received_mono_us, now - 250000);
+      row.counter(pms_age_ms, 250);
+      row.integer(pms_status, 4);
+      for (std::size_t j = 0; j < 12; ++j)
+        row.integer(static_cast<Field>(pm1_cf1_ug_m3 + j), i + j);
+    } else
+      row.integer(pms_status, 0);
+    row.number(accel_x_g, 0.125F);
+    row.number(ambient_temperature_c, std::numeric_limits<float>::quiet_NaN());
+    assert(!row.valid[ambient_temperature_c]);
+    assert(!row.valid[battery_current_ma]);
+  }
+  // A new anchor must not change a previously captured row.
+  Sample corrected{};
+  const auto old_utc = rows[1].data[event_time_utc_ns];
+  apply_clock(corrected, 30000000, 25000000, 1788889000000000000LL, 2);
+  assert(corrected.data[clock_epoch] == 2);
+  assert(corrected.data[event_time_utc_ns] == 1788889005000000000LL);
+  assert(rows[1].data[event_time_utc_ns] == old_utc);
+  prepare_columns(columns, rows);
+  const KeyValue metadata[] = {{"schema_version", kSchemaName},
+                               {"firmware", kFirmware},
+                               {"dictionary_version", kSchemaName},
+                               {"dictionary_uri", kDictionaryUri},
+                               {"dictionary_sha256", kDictionarySha256},
+                               {"acquisition_config_id", kConfigurationId},
+                               {"acquisition_config", kConfiguration},
+                               {"deployment_id", kUnknown},
+                               {"calibration_id", kUnknown},
+                               {"time_semantics", kTimeSemantics},
+                               {"purpose", "synthetic-contract-test"}};
+  FILE *file = std::fopen(argv[1], "wb");
+  if (!file)
+    return 3;
+  const auto result =
+      write_parquet(sink, file, columns, field_count, 90, workspace, metadata,
+                    sizeof(metadata) / sizeof(metadata[0]),
+                    compressed ? &compression : nullptr);
+  const bool closed = std::fclose(file) == 0;
+  return result.ok && closed ? 0 : 4;
+}

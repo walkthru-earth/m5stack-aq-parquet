@@ -24,6 +24,8 @@ The motivating [ESP32-S3 Rust trial](https://github.com/walkthru-earth/esp32s3-p
 
 Object-storage synchronization follows local file validation. Apache Iceberg is explicitly deferred; plain Parquet files can be uploaded and queried without a table catalog.
 
+The [table and observation model](table-and-observation-model.md) records the static-Iceberg assessment and SensorThings V2 draft findings. Keep table publication on the host/cloud; adopt explicit measurement/provenance semantics in firmware without claiming OGC API compliance. Its first implementation phase is distinct from the 73-column hardware evidence below.
+
 The tested conclusion is now affirmative: this CoreS3 can create interoperable Parquet directly from real ten-second rows on SD, with a full 90-row uncompressed window verified. In three identical-60-row comparisons, LZ4_RAW reduced whole-file bytes by 50.7% and median finalization time by 21.4% versus the same writer uncompressed. That is evidence for this design/workload, not a benchmark against CBOR/JSON, an energy result, a claim about allocated FAT space, or proof of production durability. [Measurements and limits](compression-benchmark.md#hardware-result-lz4-passed)
 
 The active Arduino trial stays active. [ESP-IDF 6.1](https://github.com/espressif/esp-idf/releases/tag/v6.1) is newer than the ESP-IDF 5.5.5 base inside Arduino-ESP32 3.3.11, but that alone does not justify a second trial. Start an IDF trial only after this implementation produces a measured driver, latency, memory or component limitation and record that finding in the trial README.
@@ -34,7 +36,7 @@ Every sample has an identity independent of wall-clock quality. Never turn a tim
 
 | Field | Requirement |
 | --- | --- |
-| `schema_version` | INT32 version 1; file metadata identifies `cores3-telemetry-v1`. Readers must check the actual schema as fields are added during feasibility work. |
+| `schema_version` | Current source: INT32 version 2, file metadata `cores3-telemetry-v2`, 77 columns. Earlier bench images used version 1 with 72/73 columns; check actual schema and image identity. |
 | `station_id` | UUID generated once and persisted in NVS (`parquet` namespace, `station` key); carried in file metadata and the Hive directory, not repeated as a numeric row column. Erasing NVS creates a new station identity. |
 | `device_id` | INT64 containing the board's 48-bit Wi-Fi station MAC; a hardware identifier, not an anonymized UUID. |
 | `boot_id_hi`, `boot_id_lo` | Two INT64 fields carrying a random 128-bit identifier generated once per boot. |
@@ -44,13 +46,14 @@ Every sample has an identity independent of wall-clock quality. Never turn a tim
 | `clock_status`, `clock_epoch` | Status 0 = unsynchronized, 1 = host estimate. Epoch increments at each supplied time anchor; files split when it changes. No measured clock-uncertainty bound or synchronized status is claimed. |
 | Measurements | Fixed-width typed fields with units in the schema, not encoded into display strings. |
 | Validity | Per-sensor status and validity bits; preserve missing, warming, stale, checksum error and device error distinctly. |
-| Provenance | File metadata records firmware, board, station, boot, cadence, status meanings and known unavailable measurements. Calibration/configuration versioning is future work. |
+| Provenance | File metadata records firmware, board, station, boot, cadence, status meanings and unavailable measurements. New source adds dictionary version/SHA-256 and acquisition configuration; deployment/calibration are explicitly unknown, with provisioning/history still future work. |
+| Additional v2 timing | `collection_completed_mono_us`, `pms_received_mono_us`, `clock_anchor_mono_us`, `clock_anchor_utc_ns`; see [semantics and validity](table-and-observation-model.md#timing-and-validity-dictionary). |
 
 Use `pixi run parquet-device sync-time --port <port>` to explicitly supply this host's current UTC estimate, or `--sync-time` with `parquet-device bench`. The serial `parquet time <epoch-seconds>` command anchors that value to the device monotonic clock and reports the anchor. This is not NTP and does not set or trust the RTC calendar; command/transport latency and host error are not measured. Previously buffered rows retain their original timestamps and epoch. Persisting a separate uncertainty-bearing anchor journal is future work.
 
 The anchor uses the command's monotonic receipt time, not the later time at which the storage worker handles it. This avoids adding worker-queue delay to the clock mapping, but host integer-second truncation and USB latency remain. Station UUID persists across normal resets; the UTC anchor, clock epoch and runtime interval choice do not. A new host time must be supplied after reboot. Source: [current logger](../firmware/arduino-m5unified/bringup/telemetry_logger.cpp).
 
-The current schema has **73 numeric columns**, including the clock epoch. PMS fields include atmospheric and CF=1 PM1.0/PM2.5/PM10, six cumulative particle-count channels, sensor error and framing/checksum counters. Onboard fields cover IMU readings, raw magnetic counts, raw LTR-553 light/proximity counts, power, RTC calendar, touch and memory/storage health. Unsupported battery current and ambient temperature/humidity remain null; camera frames and microphone audio are outside this scalar schema. Availability and conflicts are documented in [hardware](cores3-hardware.md) and the relevant accessory references. Carry source age/status when a row snapshots a sensor whose acquisition cadence differs from 10 seconds; these snapshots are not interval averages.
+The current flashed schema has **77 numeric columns**, appending four timing fields to the earlier 73-column codec image and advancing to schema version 2. PMS fields include atmospheric and CF=1 PM1.0/PM2.5/PM10, six cumulative particle-count channels, sensor error and framing/checksum counters. Onboard fields cover IMU readings, raw magnetic counts, raw LTR-553 light/proximity counts, power, RTC calendar, touch and memory/storage health. Unsupported battery current and ambient temperature/humidity remain null; camera frames and microphone audio are outside this scalar schema. Availability and conflicts are documented in [hardware](cores3-hardware.md) and the relevant accessory references. Carry source age/status when a row snapshots a sensor whose acquisition cadence differs from 10 seconds; these snapshots are not interval averages. The new contract passes host tests and short real SD readbacks; see [schema-v2 measured scope](bench-verified.md#board-1-schema-v2-provenance-and-timing).
 
 ## Parquet file lifecycle and optional recovery spool
 
@@ -119,13 +122,15 @@ MQTT QoS 1 can carry live gauges, alarms and device health. It is not the durabl
 
 The ingestion service can accept the device's finalized Parquet directly. Uninterrupted ten-/fifteen-minute rotation produces 144/96 files per station per UTC day; extra splits produce more. Cloud compaction can follow as fleet size and query costs warrant. Apache Iceberg catalog and snapshot management remain later work.
 
-For later deployment, OpenTelemetry belongs at the gateway and ingestion services. The current device emits acquisition/storage counters, heap/queue health and a startup reset report; RSSI, upload success and configuration/calibration versioning are not implemented telemetry yet. Add them with networking, then translate device health into cloud metrics, logs and traces.
+For later deployment, OpenTelemetry belongs at the gateway and ingestion services. The current device emits acquisition/storage counters, heap/queue health and a startup reset report. The new source adds an acquisition configuration identifier and dictionary digest; actual calibration/deployment history, RSSI and upload success remain future work. Translate device health into cloud metrics, logs and traces when networking is added.
 
 ## Offline capacity and reconnection
 
 Internet is not required for acquisition or SD finalization. With continuous power and working storage, the current firmware keeps collecting offline; it does not presently connect to a network at all. The host-supplied UTC anchor continues from the monotonic clock during an uninterrupted boot, with unmeasured drift. After reboot, UTC is null and files use the unsynced tree until a new time anchor arrives. The station UUID remains persistent. Power loss can discard the unfinished RAM batch; this is independent of available card space.
 
 **Capacity estimate, not lifetime qualification.** The tested nominal 32 GB card reports a 31,441,764,352-byte filesystem. At one row every ten seconds, there are 8,640 rows/day. Assuming future file sizes resemble the measured files and reserving 20% of the filesystem:
+
+The following file sizes are from the **73-column hardware baseline**. The new 77-column source adds timing data and footer metadata; measure its real compressed files before reusing these rates for deployment planning.
 
 | Measured file basis | Rotation assumed | File bytes/day, excluding FAT allocation overhead | Decimal GB/year | Capacity-only years with 20% reserve |
 | --- | --- | ---: | ---: | ---: |

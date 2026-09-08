@@ -13,6 +13,12 @@ printf '%s  %s\n' \
   "${LZ4_LICENSE_SHA256}" "${trial_dir}/vendor/lz4/LICENSE" | shasum -a 256 -c -
 
 mkdir -p "${build_dir}"
+# Dictionary digest is compiled into every file. Refuse stale provenance.
+dictionary_digest=$(sed -n 's/^    "\([0-9a-f]\{64\}\)";/\1/p' \
+  "${trial_dir}/bringup/telemetry_dictionary_digest.h")
+test "${#dictionary_digest}" -eq 64
+printf '%s  %s\n' "${dictionary_digest}" \
+  "${trial_dir}/bringup/telemetry_fields.inc" | shasum -a 256 -c -
 "${trial_dir}/arduino-cli.sh" compile \
   --fqbn "${CORES3_FQBN}" \
   --warnings all \

@@ -36,6 +36,7 @@ Trial directory names state the framework first, for example `firmware/idf-cpp/`
 | Wi-Fi, BLE, ESP-NOW, channels, coexistence | `docs/cores3-wireless.md` |
 | microSD, shared SPI bus, logging, power-loss recovery | `docs/cores3-storage.md` |
 | Measurement schema, Parquet, Hive partitions, clocks, future upload | `docs/telemetry-pipeline.md` |
+| Versioned dictionary, OGC semantics, static Iceberg and workflow diagrams | `docs/table-and-observation-model.md` |
 | Attaching any Unit, Module, Base, or third-party peripheral | `docs/addons.md`, then the matching `docs/addon-*.md` |
 | PM2.5 air-quality module (M134 / PMSA003) | `docs/addon-air-quality.md` |
 | Whether a board claim is measured or only source-checked | `docs/bench-verified.md` |
@@ -95,6 +96,8 @@ During an active Parquet run, prefer `pixi run parquet-device capture --port <po
 `pixi run fmt`, `pixi run fmt-check`, `pixi run lint` (cppcheck over `firmware/`), `pixi run hooks` to install pre-commit.
 
 For writer/schema or readback changes, also run `pixi run parquet-test --sanitize` and proportionate SD readback tests. The format tasks select Git-tracked C/C++ files; run clang-format explicitly on newly created, untracked sources too. Preserve vendored source bytes/licenses and their `.clang-format-ignore` exclusion. Project lint excludes vendor diagnostics and checks one configuration; the linked codec is tested with sanitizers.
+
+For the measurement contract, also run `pixi run telemetry-contract-test --sanitize`. `telemetry_fields.inc` is the single source for names/types/procedure/unit/validity; update its compiled SHA-256 intentionally when editing it. Do not invent deployment, calibration, sensor serials or UTC. Version schema changes explicitly; backward compatibility is not required, but existing saved files must not be deleted or rewritten without authorization. Mermaid diagrams should distinguish implemented work from planned services; metadata compatibility is not OGC API compliance.
 
 Keep **captures, exports, benchmark reports and retained firmware binaries in the trial's git-ignored `artifacts/` directory, outside `build/`**. Arduino cleaned `build/` during a changed-configuration rebuild and removed the first local exports/logs; SD files were retained and all finalized Parquet files were restored into `artifacts/`. Never treat a build cache as evidence storage. Record artifact identities/hashes in `docs/bench-verified.md`.
 

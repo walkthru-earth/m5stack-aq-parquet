@@ -2,6 +2,7 @@
 #include "ltr553.h"
 #include "lz4_codec.h"
 #include "parquet_writer.h"
+#include "telemetry_contract.h"
 
 #include <Arduino.h>
 #include <M5Unified.h>
@@ -33,108 +34,7 @@
 
 namespace telemetry {
 namespace {
-// Numeric units are part of the column names. All unavailable fields are null.
-// Magnetic raw counts avoid claiming a calibrated BMM150 field measurement.
-// clang-format off
-#define TELEMETRY_FIELDS(X) \
-  X(schema_version, Int32) \
-  X(device_id, Int64) \
-  X(boot_id_hi, Int64) \
-  X(boot_id_lo, Int64) \
-  X(sequence, Int64) \
-  X(monotonic_us, Int64) \
-  X(scheduled_us, Int64) \
-  X(sample_jitter_us, Int64) \
-  X(event_time_utc_ns, Int64) \
-  X(clock_status, Int32) \
-  X(pms_status, Int32) \
-  X(pms_age_ms, Int64) \
-  X(pm1_cf1_ug_m3, Int32) \
-  X(pm25_cf1_ug_m3, Int32) \
-  X(pm10_cf1_ug_m3, Int32) \
-  X(pm1_atmospheric_ug_m3, Int32) \
-  X(pm25_atmospheric_ug_m3, Int32) \
-  X(pm10_atmospheric_ug_m3, Int32) \
-  X(particles_gt03_per_01l, Int32) \
-  X(particles_gt05_per_01l, Int32) \
-  X(particles_gt10_per_01l, Int32) \
-  X(particles_gt25_per_01l, Int32) \
-  X(particles_gt50_per_01l, Int32) \
-  X(particles_gt100_per_01l, Int32) \
-  X(pms_firmware, Int32) \
-  X(pms_error, Int32) \
-  X(pms_frames, Int64) \
-  X(pms_checksum_errors, Int64) \
-  X(pms_length_errors, Int64) \
-  X(imu_fresh_mask, Int32) \
-  X(accel_x_g, Float) \
-  X(accel_y_g, Float) \
-  X(accel_z_g, Float) \
-  X(gyro_x_dps, Float) \
-  X(gyro_y_dps, Float) \
-  X(gyro_z_dps, Float) \
-  X(mag_x_raw, Int32) \
-  X(mag_y_raw, Int32) \
-  X(mag_z_raw, Int32) \
-  X(imu_temperature_c, Float) \
-  X(light_ch0_raw, Int32) \
-  X(light_ch1_raw, Int32) \
-  X(proximity_raw, Int32) \
-  X(light_status, Int32) \
-  X(proximity_status, Int32) \
-  X(vbus_mv, Int32) \
-  X(battery_mv, Int32) \
-  X(battery_percent, Int32) \
-  X(charging_status, Int32) \
-  X(battery_current_ma, Int32) \
-  X(external_5v_enabled, Int32) \
-  X(usb_output_enabled, Int32) \
-  X(rtc_date_yyyymmdd, Int32) \
-  X(rtc_time_hhmmss, Int32) \
-  X(rtc_read_ok, Int32) \
-  X(touch_points, Int32) \
-  X(touch_x_px, Int32) \
-  X(touch_y_px, Int32) \
-  X(heap_free_bytes, Int64) \
-  X(heap_min_free_bytes, Int64) \
-  X(psram_free_bytes, Int64) \
-  X(sd_total_bytes, Int64) \
-  X(sd_used_bytes, Int64) \
-  X(rows_dropped, Int64) \
-  X(sample_deadlines_missed, Int64) \
-  X(storage_errors, Int64) \
-  X(files_finalized, Int64) \
-  X(last_write_us, Int64) \
-  X(last_sync_us, Int64) \
-  X(queue_high_water, Int32) \
-  X(ambient_temperature_c, Float) \
-  X(relative_humidity_percent, Float) \
-  X(clock_epoch, Int32)
-// clang-format on
-
-enum Field : std::size_t {
-#define FIELD_ENUM(name, type) name,
-  TELEMETRY_FIELDS(FIELD_ENUM)
-#undef FIELD_ENUM
-      field_count
-};
-static_assert(field_count <= telemetry::kMaxColumns,
-              "Parquet schema capacity exceeded");
-struct Sample {
-  std::array<std::int64_t, field_count> data{};
-  std::array<std::uint8_t, field_count> valid{};
-  template <typename T> void set(Field field, T value) {
-    static_assert(sizeof(T) <= sizeof(std::int64_t), "numeric field too large");
-    std::memcpy(&data[field], &value, sizeof(value));
-    valid[field] = 1;
-  }
-  void integer(Field field, std::int32_t value) { set(field, value); }
-  void counter(Field field, std::int64_t value) { set(field, value); }
-  void number(Field field, float value) {
-    if (std::isfinite(value))
-      set(field, value);
-  }
-};
+using namespace contract;
 constexpr std::size_t kMaxRows = 90;
 constexpr std::int64_t kSampleUs = 10000000;
 constexpr const char *kDirectory = "/sd/output";
@@ -248,16 +148,7 @@ bool finalized_file(const char *path, std::uint32_t &size, std::uint32_t &crc) {
 }
 
 void prepare_columns() {
-  std::size_t index = 0;
-#define FIELD_COLUMN(name, kind)                                               \
-  writer_state->columns[index++] = Column{#name,                               \
-                                          PhysicalType::kind,                  \
-                                          &writer_state->rows[0].data[name],   \
-                                          sizeof(Sample),                      \
-                                          &writer_state->rows[0].valid[name],  \
-                                          sizeof(Sample)};
-  TELEMETRY_FIELDS(FIELD_COLUMN)
-#undef FIELD_COLUMN
+  contract::prepare_columns(writer_state->columns, writer_state->rows);
 }
 
 bool station_identity() {
@@ -385,12 +276,24 @@ bool write_batch(std::size_t count, bool benchmark = false,
   // Internal RAM staging is deliberately distinct from the PSRAM row buffer.
   char staging[4096];
   std::setvbuf(file, staging, _IOFBF, sizeof(staging));
+  char interval_text[12];
+  std::snprintf(interval_text, sizeof(interval_text), "%lu",
+                static_cast<unsigned long>(rotation_seconds.load()));
   const KeyValue metadata[] = {
-      {"schema_version", "cores3-telemetry-v1"},
+      {"schema_version", kSchemaName},
       {"device_id", device_text},
       {"station_id", station_text},
       {"boot_id", boot_text},
-      {"firmware", "arduino-cores3-parquet-v2"},
+      {"firmware", kFirmware},
+      {"dictionary_version", kSchemaName},
+      {"dictionary_uri", kDictionaryUri},
+      {"dictionary_sha256", kDictionarySha256},
+      {"acquisition_config_id", kConfigurationId},
+      {"acquisition_config", kConfiguration},
+      {"deployment_id", kUnknown},
+      {"calibration_id", kUnknown},
+      {"time_semantics", kTimeSemantics},
+      {"rotation_interval_s", interval_text},
       {"compression", codec_name(codec)},
       {"purpose", benchmark ? "codec-comparison-duplicate-rows" : "telemetry"},
       {"board", "CoreS3 ESP32-S3 rev0.2"},
@@ -673,13 +576,26 @@ void storage_worker(void *) {
       Serial.printf(
           "PARQUET STATUS interval_s=%lu buffered=%u finalized=%lu "
           "dropped=%lu errors=%lu queue_peak=%lu failed=%s station=%s "
-          "codec=%s\n",
+          "codec=%s schema=%s config=%s deployment=unknown "
+          "calibration=unknown\n",
           static_cast<unsigned long>(rotation_seconds.load()), unsigned(count),
           static_cast<unsigned long>(finalized.load()),
           static_cast<unsigned long>(dropped.load()),
           static_cast<unsigned long>(errors.load()),
           static_cast<unsigned long>(queue_peak.load()),
-          failed ? "true" : "false", station_text, codec_name(selected_codec));
+          failed ? "true" : "false", station_text, codec_name(selected_codec),
+          kSchemaName, kConfigurationId);
+    } else if (std::strcmp(command.text, "parquet schema") == 0) {
+      Serial.printf("PARQUET SCHEMA BEGIN schema=%s columns=%u sha256=%s\n",
+                    kSchemaName, unsigned(field_count), kDictionarySha256);
+      for (const auto &field : kFields) {
+        Serial.printf("PARQUET FIELD name=%s type=%u procedure=%s unit=%s "
+                      "validity=%s property=%s\n",
+                      field.name, unsigned(field.type), field.procedure,
+                      field.unit, field.validity, field.property_uri);
+        delay(1);
+      }
+      Serial.println("PARQUET SCHEMA END");
     } else if (std::strcmp(command.text, "parquet codec-test") == 0) {
       if (!count || !storage_ready || failed) {
         Serial.println("PARQUET ERROR operation=codec-test "
@@ -753,7 +669,7 @@ void storage_worker(void *) {
 
 void collect(const PmsSnapshot &pms, std::int64_t now, std::int64_t scheduled) {
   Sample row;
-  row.integer(schema_version, 1);
+  row.integer(schema_version, kSchemaVersion);
   row.counter(device_id, device);
   row.counter(boot_id_hi, boot_hi);
   row.counter(boot_id_lo, boot_lo);
@@ -768,10 +684,7 @@ void collect(const PmsSnapshot &pms, std::int64_t now, std::int64_t scheduled) {
   mono_anchor = anchor_mono_us;
   generation = clock_generation;
   portEXIT_CRITICAL(&clock_mutex);
-  row.integer(clock_status, generation ? 1 : 0);
-  row.integer(clock_epoch, generation);
-  if (generation)
-    row.counter(event_time_utc_ns, utc_anchor + (now - mono_anchor) * 1000);
+  apply_clock(row, now, mono_anchor, utc_anchor, generation);
   const int status = !pms.present        ? 0
                      : now < 30000000    ? 1
                      : pms.age_ms > 5000 ? 2
@@ -780,6 +693,7 @@ void collect(const PmsSnapshot &pms, std::int64_t now, std::int64_t scheduled) {
   row.integer(pms_status, status);
   if (pms.present) {
     row.counter(pms_age_ms, pms.age_ms);
+    row.counter(pms_received_mono_us, pms.received_mono_us);
     row.integer(pms_firmware, pms.firmware);
     row.integer(pms_error, pms.error);
   }
@@ -867,6 +781,7 @@ void collect(const PmsSnapshot &pms, std::int64_t now, std::int64_t scheduled) {
   row.counter(last_write_us, write_us.load());
   row.counter(last_sync_us, sync_us.load());
   row.integer(queue_high_water, queue_peak.load());
+  row.counter(collection_completed_mono_us, esp_timer_get_time());
   if (xQueueSend(samples, &row, 0) != pdTRUE)
     ++dropped;
   const auto depth =
@@ -939,10 +854,10 @@ void begin_logger(bool sd_mounted) {
   }
   accepting = true;
   Serial.printf(
-      "PARQUET BEGIN schema=cores3-telemetry-v1 columns=%u sample_s=10 "
+      "PARQUET BEGIN schema=%s columns=%u sample_s=10 "
       "interval_s=900 max_rows=90 psram_workspace_bytes=%u row_bytes=%u "
       "boot=%s station=%s light_available=%s codec=UNCOMPRESSED\n",
-      unsigned(field_count), unsigned(sizeof(WriterState)),
+      kSchemaName, unsigned(field_count), unsigned(sizeof(WriterState)),
       unsigned(sizeof(Sample)), boot_text, station_text,
       light ? "true" : "false");
 }
