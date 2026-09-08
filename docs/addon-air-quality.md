@@ -1,7 +1,7 @@
 # Optional accessory: M134 air-quality module
 
 Read only when this accessory is selected; CoreS3 does not contain these sensors.
-Verified 2026-09-06 against linked sources; wiring below is a schematic comparison, not a hardware-tested compatibility claim.
+Source-checked 2026-09-06 and bench-updated 2026-09-08. Wiring remains a schematic comparison; the PMS UART path is now verified on Board 1.
 
 ## Identify the hardware first
 
@@ -47,6 +47,8 @@ The schematic's J3 USB-C connects VBUS directly to bus 5 V and carries no USB da
 | Commands | `42 4D CMD 00 DATA checksum16`; E1: passive=0/active=1; E2: passive read; E4: sleep=0/wake=1 |
 
 Default active output has variable cadence and repeated frames; passive mode changes reporting, not fan power. Keep inlet/outlet clear and prevent recirculation; enclosure instructions are on p.11.
+
+Bench result, 2026-09-08: Board 1 received checksum-valid active PMSA003 frames on GPIO18/GPIO17. A 24-second capture produced two 10-second application reports with fresh-frame ages below one second and zero parser checksum or length failures across 23 frames. This verifies the UART path and parser on the attached unit; warm-up, sustained operation and calibration remain open.
 
 Parser keywords: bounded streaming, resynchronization, length/checksum/status validation, partial/concatenated-frame tests, stale/error counters, explicit byte decoding. Keep consumption independent of uploads/display. Timeouts mean invalid samples, not zero pollution. Use timestamp-based windows; variable/repeated frames distort frame-count averages. Preserve calibration-field identity; atmospheric fields suit ambient monitoring.
 

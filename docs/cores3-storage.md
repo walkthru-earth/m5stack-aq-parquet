@@ -1,6 +1,6 @@
 # CoreS3 microSD and logging
 
-[Router](README.md) · Read for the **built-in slot**, shared SPI, file logging or data export. Card presence is optional. Source snapshot **2026-09-06**; no card/firmware combination has been bench-tested here.
+[Router](README.md) · Read for the **built-in slot**, shared SPI, file logging or data export. Card presence is optional. Source snapshot **2026-09-08**; one card mount is bench-verified, while writes and power-loss behavior remain untested.
 
 ## Wiring and ownership
 
@@ -10,7 +10,7 @@
 | Display sharing | LCD CS3; SCK36/MOSI37 shared. **GPIO35 is LCD DC while CS3 is low, and SD MISO while CS3 is high**. M5GFX switches its direction; a generic always-output LCD DC driver causes contention. [CoreS3 panel implementation][gfx] |
 | SPI host | M5GFX's CoreS3 configuration uses `SPI2_HOST`; do not drive the same wires through another host or independently reinitialize its peripheral state. [Tagged configuration][gfx] |
 | Power / detect | AXP2101 **ALDO4 = 3.3 V** powers the card; `TF_SW` is AW9523 **P0_4**, not an ESP GPIO. Board power/expander setup is required; see [hardware](cores3-hardware.md). [Power setup][power] |
-| Capacity | M5 lists **16 GB maximum**; treat that as its documented support envelope. Larger cards require explicit board/card/filesystem qualification, not an assumed silicon limit. [Board specification][board] |
+| Capacity | M5 lists **16 GB maximum**. This board mounted one nominal 32 GB SDHC card and reported 31,457,280,000 bytes, which proves that card can mount but does not qualify power-loss behavior or every larger card. Keep M5's figure as the general support envelope and record larger tested card models separately. [Board specification][board], [measured](bench-verified.md) |
 
 ## Bring-up paths
 
@@ -21,6 +21,8 @@
 - The M5 example requests 25 MHz; this is not a guaranteed throughput or a universal maximum. Reduce the transfer clock when debugging integrity, and inspect rail stability, CS timing and bus loading before increasing it. Protocol probing starts slowly. [M5 example][m5-sd], [signal loading][sharing]
 
 ## Concurrent logging design
+
+The record, segment, upload and Parquet decisions live in the [telemetry pipeline](telemetry-pipeline.md). This file owns the physical SD and filesystem constraints.
 
 - Give storage one worker and a bounded queue. Serialize display/SD bus access with a common application mutex; complete display DMA and end any held display transaction before SD access. Keep each bus hold short; release before waiting for network or sensor work. A task per core does not make shared wires concurrent.
 - Start with batched sequential writes, e.g. 4–16 KiB in 512-byte multiples, then measure worst-case write/sync latency. Keep DMA staging internal/aligned; PSRAM can hold backlog if the driver copies safely. Size the queue from measured stalls and record dropped samples. FatFs sector-aligned multi-sector I/O reduces overhead. [FatFs performance notes][appnote]

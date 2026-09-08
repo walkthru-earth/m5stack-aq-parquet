@@ -66,6 +66,8 @@ GPIO0's generic M-Bus `I2S_LRCK` label does **not** describe the onboard audio c
 
 BMM150 is not an ordinary directly attached 0x10 device; a simple system-bus scan does not establish its absence. Keep its sensor-hub setup intact. Calibrate with the assembled enclosure; magnets/speaker/stack hardware affect compass results.
 
+On ESP32-S3, do not probe reserved 7-bit addresses `0x00` through `0x07`. M5Unified 0.2.21 deliberately starts its full-bus scan at `0x08` because probing the low range can stop the controller. The first diagnostic reproduced that hang on this board; scan only `0x08` through `0x77`. [M5Unified implementation](https://github.com/m5stack/M5Unified/blob/0.2.21/src/utility/I2C_Class.cpp#L105-L112), [measured](bench-verified.md)
+
 AW9523B map; `P0_n/P1_n` are expander bits, not ESP GPIOs. Registers: input **0x00/01**, output **0x02/03**, direction **0x04/05** (`1=input`). [Schematic p5][sch], [Initialization][gfx]; remaining register semantics: [AW9523 datasheet][aw].
 
 | Bank | Bit 0 | Bit 1 | Bit 2 | Bit 3 | Bit 4 | Bit 5 | Bit 6 | Bit 7 |
