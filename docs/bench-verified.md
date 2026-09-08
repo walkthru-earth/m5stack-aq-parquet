@@ -52,6 +52,7 @@ Verified **2026-09-08** with `cores3-bringup-v1`, built from Arduino-ESP32 3.3.1
 | microSD | One nominal 32 GB SDHC card mounted at 25 MHz; card size 31,457,280,000 bytes, filesystem size 31,441,764,352 bytes | Arduino SD API; no format or file write |
 | PMSA003 | Checksum-valid frame, sensor error 0, firmware 151 | GPIO18 RX/GPIO17 TX at 9600, bounded five-second parser |
 | Live PMS interval | Two successive reports approximately 10 seconds apart; latest-frame ages 423 ms and 804 ms; zero checksum and length failures across 23 frames | 24-second bounded serial capture after flashing the live-display revision |
+| Touch UI | Final image uses 554,315 bytes of program storage and 26,276 bytes of static internal RAM. Flash hashes verified. Up and down swipes plus taps reached all three pages while four timed PMS reports continued with zero parser failures. | Flash plus a 40-second serial capture during the touch test |
 
 The PMS frame reported atmospheric PM1, PM2.5 and PM10 values of 19, 24 and 26 µg/m³. This confirms framing and transport for the attached sensor; one reading does not validate calibration.
 
@@ -80,7 +81,7 @@ Nothing below has been observed on a real board yet. Do not promote any of it in
 - microSD write, sync, latency, power-loss recovery and long-running coexistence with display traffic.
 - Battery presence, charging behavior and current measurement with a known battery state.
 - RTC date/time validity and retention.
-- LCD live-page appearance and touch coordinates under active input.
+- LCD page text and layout for clipping under explicit visual inspection.
 - Sustained PMSA003 sampling, warm-up behavior and optional SHT20 isolation.
 - Wi-Fi, BLE, upload, OTA, watchdog and sleep behavior.
 

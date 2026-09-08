@@ -10,7 +10,7 @@ The repo can hold **more than one framework trial** against the same board, shar
 
 ## Current status
 
-The only active trial is [Arduino-ESP32 with M5Unified](firmware/arduino-m5unified/README.md), pinned to Arduino-ESP32 3.3.11, M5Unified 0.2.21 and M5GFX 0.2.28. Its diagnostic has been built and verified on the real board. The current flashed image shows all PMSA003 mass and particle-count values on the LCD and refreshes from a checksum-valid frame every 10 seconds.
+The only active trial is [Arduino-ESP32 with M5Unified](firmware/arduino-m5unified/README.md), pinned to Arduino-ESP32 3.3.11, M5Unified 0.2.21 and M5GFX 0.2.28. Its diagnostic has been built and verified on the real board. The current flashed image presents all PMSA003 mass and particle-count values plus device health across three touch-navigable LCD pages and refreshes from a checksum-valid frame every 10 seconds.
 
 The storage design uses a bounded PSRAM queue, one microSD writer, recoverable immutable segments and idempotent upload. Current C/C++ Parquet libraries are assessed in the telemetry note; direct Parquet on the S3 remains a later conformance and power-cut experiment.
 

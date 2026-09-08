@@ -22,6 +22,8 @@ constexpr std::uint32_t kSerialBaud = 115200;
 constexpr std::uint32_t kI2cScanFrequency = 100000;
 constexpr std::uint32_t kPmsProbeDurationMs = 5000;
 constexpr std::uint32_t kDisplayIntervalMs = 10000;
+constexpr std::uint8_t kScreenPageCount = 3;
+constexpr int kMinimumSwipeDistance = 40;
 constexpr int kSdSck = 36;
 constexpr int kSdMiso = 35;
 constexpr int kSdMosi = 37;
@@ -135,6 +137,7 @@ bool sd_mounted = false;
 std::uint32_t latest_pms_ms = 0;
 std::uint32_t pms_frame_count = 0;
 std::uint32_t last_display_ms = 0;
+std::uint8_t screen_page = 0;
 
 const char *board_name(m5::board_t board) {
   switch (board) {
@@ -482,70 +485,207 @@ void draw_pm_triplet(std::uint16_t pm1, std::uint16_t pm25, std::uint16_t pm10,
   }
 }
 
-void show_pms_screen() {
-  M5.Display.setRotation(1);
-  M5.Display.fillScreen(TFT_BLACK);
-  M5.Display.setTextColor(TFT_WHITE, TFT_BLACK);
+void draw_screen_header(const char *title) {
   M5.Display.setTextSize(2);
   M5.Display.setCursor(8, 5);
-  M5.Display.print("PMSA003 live");
+  M5.Display.print(title);
   M5.Display.setTextSize(1);
-  M5.Display.setCursor(222, 10);
-  M5.Display.print("10 s refresh");
+  M5.Display.setCursor(279, 10);
+  M5.Display.printf("%u/%u", static_cast<unsigned>(screen_page + 1),
+                    static_cast<unsigned>(kScreenPageCount));
 
-  if (!has_pms_frame) {
-    M5.Display.setTextSize(2);
-    M5.Display.setCursor(8, 48);
-    M5.Display.print("Waiting for a valid frame");
-    M5.Display.setTextSize(1);
-    M5.Display.setCursor(8, 78);
-    M5.Display.printf(
-        "CRC failures: %lu  length failures: %lu",
-        static_cast<unsigned long>(pms_parser.checksum_failures()),
-        static_cast<unsigned long>(pms_parser.length_failures()));
-    return;
-  }
+  constexpr int bar_top = 31;
+  constexpr int bar_height = 184;
+  const int marker_height = bar_height / kScreenPageCount;
+  M5.Display.fillRect(316, bar_top, 3, bar_height, TFT_DARKGREY);
+  M5.Display.fillRect(316, bar_top + marker_height * screen_page, 3,
+                      marker_height, TFT_WHITE);
+}
 
-  M5.Display.setCursor(8, 30);
-  M5.Display.print("Atmospheric mass concentration (ug/m3)");
+void draw_screen_footer() {
+  M5.Display.setTextSize(1);
+  M5.Display.setCursor(8, 228);
+  M5.Display.print("Swipe up/down or tap for pages");
+}
+
+void draw_waiting_for_pms() {
+  M5.Display.setTextSize(2);
+  M5.Display.setCursor(8, 48);
+  M5.Display.print("Waiting for a valid frame");
+  M5.Display.setTextSize(1);
+  M5.Display.setCursor(8, 78);
+  M5.Display.printf("CRC failures: %lu  length failures: %lu",
+                    static_cast<unsigned long>(pms_parser.checksum_failures()),
+                    static_cast<unsigned long>(pms_parser.length_failures()));
+}
+
+void draw_mass_page() {
+  M5.Display.setTextSize(1);
+  M5.Display.setCursor(8, 31);
+  M5.Display.print("Mass concentration in ug/m3");
+  M5.Display.setCursor(8, 48);
+  M5.Display.print("Atmospheric");
   draw_pm_triplet(latest_pms_frame.atmospheric_pm1,
                   latest_pms_frame.atmospheric_pm25,
-                  latest_pms_frame.atmospheric_pm10, 43, 54);
+                  latest_pms_frame.atmospheric_pm10, 61, 73);
 
-  M5.Display.setCursor(8, 79);
-  M5.Display.print("CF=1 mass concentration (ug/m3)");
+  M5.Display.setCursor(8, 104);
+  M5.Display.print("CF=1");
   draw_pm_triplet(latest_pms_frame.cf1_pm1, latest_pms_frame.cf1_pm25,
-                  latest_pms_frame.cf1_pm10, 92, 103);
+                  latest_pms_frame.cf1_pm10, 117, 129);
 
   M5.Display.setTextSize(1);
-  M5.Display.setCursor(8, 129);
-  M5.Display.print("Particle counts per 0.1 L");
-  M5.Display.setCursor(8, 143);
-  M5.Display.printf(">0.3um %-5u  >0.5um %-5u",
-                    latest_pms_frame.particle_counts[0],
-                    latest_pms_frame.particle_counts[1]);
-  M5.Display.setCursor(8, 156);
-  M5.Display.printf(">1.0um %-5u  >2.5um %-5u",
-                    latest_pms_frame.particle_counts[2],
-                    latest_pms_frame.particle_counts[3]);
-  M5.Display.setCursor(8, 169);
-  M5.Display.printf(">5.0um %-5u  >10um  %-5u",
-                    latest_pms_frame.particle_counts[4],
-                    latest_pms_frame.particle_counts[5]);
+  M5.Display.setCursor(8, 171);
+  M5.Display.printf("Status: %s  sensor error=%u",
+                    latest_pms_frame.sensor_error == 0 ? "valid" : "sensor",
+                    latest_pms_frame.sensor_error);
+  M5.Display.setCursor(8, 187);
+  M5.Display.printf("Latest frame: %lu ms ago  sensor FW: %u",
+                    static_cast<unsigned long>(millis() - latest_pms_ms),
+                    latest_pms_frame.firmware_version);
+  M5.Display.setCursor(8, 203);
+  M5.Display.printf("Display and serial refresh every %lu s",
+                    static_cast<unsigned long>(kDisplayIntervalMs / 1000));
+}
 
-  M5.Display.setCursor(8, 190);
-  M5.Display.printf(
-      "Status: %s  error=%u  age=%lus",
-      latest_pms_frame.sensor_error == 0 ? "valid" : "sensor",
-      latest_pms_frame.sensor_error,
-      static_cast<unsigned long>((millis() - latest_pms_ms) / 1000));
-  M5.Display.setCursor(8, 204);
+void draw_count_pair(const char *left_label, std::uint16_t left_value,
+                     const char *right_label, std::uint16_t right_value,
+                     int label_y, int value_y) {
+  constexpr int right_x = 168;
+  M5.Display.setTextSize(1);
+  M5.Display.setCursor(8, label_y);
+  M5.Display.print(left_label);
+  M5.Display.setCursor(right_x, label_y);
+  M5.Display.print(right_label);
+  M5.Display.setTextSize(2);
+  M5.Display.setCursor(8, value_y);
+  M5.Display.printf("%u", left_value);
+  M5.Display.setCursor(right_x, value_y);
+  M5.Display.printf("%u", right_value);
+}
+
+void draw_counts_page() {
+  M5.Display.setTextSize(1);
+  M5.Display.setCursor(8, 31);
+  M5.Display.print("Cumulative particle counts per 0.1 L");
+  draw_count_pair(">0.3 um", latest_pms_frame.particle_counts[0], ">0.5 um",
+                  latest_pms_frame.particle_counts[1], 49, 61);
+  draw_count_pair(">1.0 um", latest_pms_frame.particle_counts[2], ">2.5 um",
+                  latest_pms_frame.particle_counts[3], 91, 103);
+  draw_count_pair(">5.0 um", latest_pms_frame.particle_counts[4], ">10 um",
+                  latest_pms_frame.particle_counts[5], 133, 145);
+
+  M5.Display.setTextSize(1);
+  M5.Display.setCursor(8, 179);
   M5.Display.printf("Frames=%lu  CRC=%lu  length=%lu",
                     static_cast<unsigned long>(pms_frame_count),
                     static_cast<unsigned long>(pms_parser.checksum_failures()),
                     static_cast<unsigned long>(pms_parser.length_failures()));
-  M5.Display.setCursor(8, 218);
-  M5.Display.printf("SD: %s", sd_mounted ? "mounted" : "not mounted");
+  M5.Display.setCursor(8, 196);
+  M5.Display.printf("Sensor FW=%u  error=%u  age=%lu ms",
+                    latest_pms_frame.firmware_version,
+                    latest_pms_frame.sensor_error,
+                    static_cast<unsigned long>(millis() - latest_pms_ms));
+}
+
+void draw_device_page() {
+  M5.Display.setTextSize(1);
+  M5.Display.setCursor(8, 35);
+  M5.Display.printf("SD card: %s", sd_mounted ? "mounted" : "not mounted");
+  M5.Display.setCursor(8, 55);
+  M5.Display.printf("VBUS: %d mV", static_cast<int>(M5.Power.getVBUSVoltage()));
+  M5.Display.setCursor(168, 55);
+  M5.Display.printf("Battery: %d mV",
+                    static_cast<int>(M5.Power.getBatteryVoltage()));
+  M5.Display.setCursor(8, 75);
+  M5.Display.printf("Battery: %ld%%  %s",
+                    static_cast<long>(M5.Power.getBatteryLevel()),
+                    charging_name(M5.Power.isCharging()));
+
+  M5.Display.setCursor(8, 103);
+  M5.Display.printf("Internal heap free: %lu bytes",
+                    static_cast<unsigned long>(ESP.getFreeHeap()));
+  M5.Display.setCursor(8, 123);
+  M5.Display.printf("Internal heap minimum: %lu bytes",
+                    static_cast<unsigned long>(ESP.getMinFreeHeap()));
+  M5.Display.setCursor(8, 143);
+  M5.Display.printf("PSRAM free: %lu / %lu bytes",
+                    static_cast<unsigned long>(ESP.getFreePsram()),
+                    static_cast<unsigned long>(ESP.getPsramSize()));
+
+  M5.Display.setCursor(8, 171);
+  M5.Display.printf("Uptime: %lu s",
+                    static_cast<unsigned long>(millis() / 1000));
+  M5.Display.setCursor(168, 171);
+  M5.Display.printf("PMS frames: %lu",
+                    static_cast<unsigned long>(pms_frame_count));
+  M5.Display.setCursor(8, 191);
+  M5.Display.printf("Touch: %s  refresh: %lu s",
+                    M5.Touch.isEnabled() ? "enabled" : "disabled",
+                    static_cast<unsigned long>(kDisplayIntervalMs / 1000));
+}
+
+void show_pms_screen() {
+  M5.Display.setRotation(1);
+  M5.Display.fillScreen(TFT_BLACK);
+  M5.Display.setTextColor(TFT_WHITE, TFT_BLACK);
+
+  constexpr const char *titles[kScreenPageCount] = {
+      "PM mass", "Particle counts", "Device health"};
+  draw_screen_header(titles[screen_page]);
+
+  if (!has_pms_frame && screen_page != 2) {
+    draw_waiting_for_pms();
+  } else if (screen_page == 0) {
+    draw_mass_page();
+  } else if (screen_page == 1) {
+    draw_counts_page();
+  } else {
+    draw_device_page();
+  }
+  draw_screen_footer();
+}
+
+void handle_touch_navigation() {
+  if (!M5.Touch.isEnabled() || M5.Touch.getCount() == 0) {
+    return;
+  }
+
+  const auto &touch = M5.Touch.getDetail();
+  std::uint8_t next_page = screen_page;
+  const char *gesture = nullptr;
+
+  if (touch.wasClicked()) {
+    next_page = static_cast<std::uint8_t>((screen_page + 1) % kScreenPageCount);
+    gesture = "tap";
+  } else if (touch.wasFlicked()) {
+    const int distance_x = touch.distanceX();
+    const int distance_y = touch.distanceY();
+    const int absolute_x = distance_x < 0 ? -distance_x : distance_x;
+    const int absolute_y = distance_y < 0 ? -distance_y : distance_y;
+
+    if (absolute_y >= absolute_x && absolute_y >= kMinimumSwipeDistance &&
+        distance_y < 0) {
+      next_page =
+          static_cast<std::uint8_t>((screen_page + 1) % kScreenPageCount);
+      gesture = "forward-swipe";
+    } else if (absolute_y >= absolute_x &&
+               absolute_y >= kMinimumSwipeDistance && distance_y > 0) {
+      next_page = static_cast<std::uint8_t>(
+          (screen_page + kScreenPageCount - 1) % kScreenPageCount);
+      gesture = "back-swipe";
+    }
+  }
+
+  if (gesture == nullptr || next_page == screen_page) {
+    return;
+  }
+
+  screen_page = next_page;
+  show_pms_screen();
+  Serial.printf("UI page=%u/%u gesture=%s\n",
+                static_cast<unsigned>(screen_page + 1),
+                static_cast<unsigned>(kScreenPageCount), gesture);
 }
 
 } // namespace
@@ -582,6 +722,7 @@ void setup() {
 void loop() {
   M5.update();
   poll_pms();
+  handle_touch_navigation();
   const std::uint32_t now = millis();
   if (static_cast<std::uint32_t>(now - last_display_ms) >= kDisplayIntervalMs) {
     show_pms_screen();

@@ -47,7 +47,7 @@ A physical RST press makes this CoreS3 disappear and re-enumerate on macOS. The 
 6. microSD mount on the display-shared SPI bus, without formatting or writing;
 7. PMSA003 framing, length and checksum on GPIO18 RX and GPIO17 TX.
 
-After bring-up, the UART parser continues draining the active PMS stream. Every 10 seconds the LCD and serial output refresh from the latest checksum-valid frame. The LCD shows atmospheric and CF=1 PM1.0/PM2.5/PM10 mass values, all six particle-count thresholds, frame age, sensor status, parser failures and SD state.
+After bring-up, the UART parser continues draining the active PMS stream. Every 10 seconds the LCD and serial output refresh from the latest checksum-valid frame. The LCD has three pages: atmospheric and CF=1 PM1.0/PM2.5/PM10 mass values; all six particle-count thresholds with sensor and parser integrity; and live SD, power, heap, PSRAM and uptime health. Swipe vertically or tap to move between pages. Page changes redraw immediately without changing the measurement cadence.
 
 The scan excludes reserved I2C addresses `0x00` through `0x07`. Probing that range stopped the ESP32-S3 controller during the first hardware run; M5Unified's own scanner carries the same restriction.
 
@@ -55,7 +55,7 @@ The scan excludes reserved I2C addresses `0x00` through `0x07`. Probing that ran
 
 The first diagnostic confirmed 16 MB QIO flash, **8 MB Quad PSRAM**, all nine expected onboard I2C devices, working IMU and touch communication, a mounted nominal 32 GB SDHC card and a checksum-valid PMSA003 frame. The RTC acknowledged at `0x51` but its date/time read failed. PMIC values indicated USB input and near-zero battery voltage, so battery presence and charging remain unverified.
 
-The full values and test method are recorded in [the bench record](../../docs/bench-verified.md). The initial verified sketch used 551,263 bytes of program storage and 26,188 bytes of static internal RAM. The live-display revision uses 552,795 bytes of program storage and 26,268 bytes of static internal RAM. It was flashed and produced two verified 10-second serial refreshes; the LCD layout still needs a visual check by someone looking at the board.
+The full values and test method are recorded in [the bench record](../../docs/bench-verified.md). The initial verified sketch used 551,263 bytes of program storage and 26,188 bytes of static internal RAM. The single-page live-display revision used 552,795 bytes and 26,268 bytes; the current three-page touch revision uses 554,315 bytes and 26,276 bytes. The current image was flashed with hash verification, produced a fresh 10-second sensor report with zero parser failures and logged page changes from touch gestures. The physical layout and gesture feel still need a deliberate visual check by someone looking at the board.
 
 ## Next milestone
 
