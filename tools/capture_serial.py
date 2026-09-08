@@ -47,7 +47,7 @@ def main() -> int:
         print(f"could not open {args.port}, {exc}", file=sys.stderr)
         return 1
 
-    with port:
+    try:
         if args.reset:
             # Standard esp32 auto-reset pulse. Leaves the chip running the app.
             port.setDTR(False)
@@ -59,9 +59,24 @@ def main() -> int:
 
         collected = bytearray()
         deadline = time.monotonic() + args.seconds
+        reconnecting = False
         # The bound is always enforced, so a silent board cannot hang this.
         while time.monotonic() < deadline:
-            chunk = port.read(4096)
+            try:
+                chunk = port.read(4096)
+            except (OSError, serial.SerialException):
+                port.close()
+                reconnecting = True
+                while time.monotonic() < deadline:
+                    try:
+                        port = serial.Serial(args.port, args.baud, timeout=0.2)
+                        print("\n[capture] serial device reconnected", file=sys.stderr)
+                        break
+                    except (OSError, serial.SerialException):
+                        time.sleep(0.05)
+                else:
+                    break
+                continue
             if chunk:
                 collected += chunk
                 sys.stdout.write(chunk.decode("utf-8", "replace"))
@@ -69,6 +84,8 @@ def main() -> int:
                 if args.until and args.until.encode() in collected:
                     print(f"\n[capture] matched {args.until!r}, stopping early", file=sys.stderr)
                     break
+    finally:
+        port.close()
 
     text = collected.decode("utf-8", "replace")
     if args.out:
@@ -78,8 +95,9 @@ def main() -> int:
         print(f"\n[capture] {len(collected)} bytes to {out}", file=sys.stderr)
 
     if not collected:
+        reconnect_note = " after USB re-enumeration" if reconnecting else ""
         print(
-            "\n[capture] nothing received. The board may be in the ROM download "
+            f"\n[capture] nothing received{reconnect_note}. The board may be in the ROM download "
             "bootloader, which prints nothing, or the app may not be running.",
             file=sys.stderr,
         )

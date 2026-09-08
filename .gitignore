@@ -12,3 +12,6 @@ backup/
 # defensively in case a tool ever writes one here.
 .toolchains/
 
+# Host Python bytecode
+__pycache__/
+*.py[cod]
