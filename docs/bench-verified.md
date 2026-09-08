@@ -56,6 +56,40 @@ Verified **2026-09-08** with `cores3-bringup-v1`, built from Arduino-ESP32 3.3.1
 
 The PMS frame reported atmospheric PM1, PM2.5 and PM10 values of 19, 24 and 26 µg/m³. This confirms framing and transport for the attached sensor; one reading does not validate calibration.
 
+## Board 1, on-device Parquet and Hive partitions
+
+Verified **2026-09-08**, on the same board and mounted nominal 32 GB SDHC card, using the active Arduino trial and the pinned versions above. Repeated port, chip, flash-ID and read-only eFuse checks before flashing; confirmed `backup/cores3-flash-20260906T102150Z.bin` is exactly 16,777,216 bytes. Flash hashes verified. No formatting, file deletion, eFuse write or radio setup was performed.
+
+The firmware collected real scalar snapshots every ten seconds while the PMS parser and display continued running. A separate storage task wrote Parquet directly to SD; the host fetched the existing bytes over USB, checked transfer length/CRC32 and compared every stored value/null with **PyArrow 25.0.0 and DuckDB 1.5.5**. This was not host-side conversion. All files below use uncompressed pages, one row group and one page per column.
+
+| Run | Measured result |
+| --- | --- |
+| Initial manual flush, 72-column flat-path image | 7 rows, sequences 0–6; 9,494 bytes, including a 5,490-byte footer; finalization 51,998 µs, flush/sync/close 12,765 µs |
+| Automatic 10-minute batch, same image | **60 rows**, sequences 7–66; **28,059 bytes**; finalization **122,041 µs**, flush/sync/close **13,317 µs**; both readers matched |
+| Sampling in the 60-row file | Adjacent intervals 9,990,877–10,015,182 µs; mean 10,000,237 µs; maximum deadline jitter 18,671 µs. Drop, missed-deadline, storage-error and PMS checksum/length-error counters were all zero in the file |
+| Memory at that automatic finalization | Internal heap free 310,216 bytes; PSRAM free 8,290,860 bytes; reported storage-task stack free 7,480 bytes |
+| Current Hive image | **73 columns**, including `clock_epoch`; program storage 579,711 bytes, static internal RAM 26,988 bytes; PSRAM batch/descriptors/workspace allocation 63,560 bytes, 664 bytes per in-memory row; default interval 900 seconds |
+| UTC Hive file, manual flush | 3 rows, sequences 0–2; 8,319 bytes; finalization 58,463 µs, flush/sync/close 11,298 µs; all UTC values present with host-clock status/epoch 1. UTC date and 18:30 window agreed with the path. Both readers matched; DuckDB Hive discovery returned the expected station and date |
+| Automatic quarter-hour boundary | The next file contained sequence 3 under `data_1830_…` (7,630 bytes, both readers matched); subsequent sequences 4–9 were finalized under `data_1845_…`. This verifies a boundary split, **not a full 90-row/15-minute run** |
+| Hive image memory at initial finalization | Internal heap free 308,260 bytes; PSRAM free 8,288,812 bytes; reported storage-task stack free 5,632 bytes |
+| Normal software restart | Station UUID remained `53315f5f-cb85-4d8d-b623-d56266084189`; boot ID changed. Three finalized dated files were still enumerated. Re-fetching the initial 8,319-byte Hive file matched the pre-restart file byte-for-byte and passed both readers again |
+| No UTC after restart | A new 3-row, 8,295-byte file was written under `station=<UUID>/unsynced/boot=<new-boot>/`; all three UTC values were null and both readers matched. Unsynced rows were not assigned a fabricated calendar date |
+| Host time restored after restart | The pending unsynced sequence 22 was finalized separately; sequences 23–25 formed a dated 8,343-byte `data_1845_…` file, CRC32 `7d898d53`. Both readers and per-row UTC/path agreement passed. Capture: `hive-resync.log` |
+| Runtime interval commands | `parquet interval 600` and then `parquet interval 900` each finalized pending rows and acknowledged the new interval. The device was returned to 900 seconds |
+| Final live status | `interval_s=900 buffered=11 finalized=5 dropped=0 errors=0 queue_peak=1 failed=false`; host time had been restored and the logger was left running |
+| Scalar sensor availability | PMS values became non-null after the software warm-up gate; IMU freshness mask was 7; raw light and proximity reads were valid. RTC calendar, ambient temperature/humidity and unsupported battery current remained null. This verifies acquisition, not sensor calibration or warm-up sufficiency |
+
+`write_us` measures the finalization path including writing, sync/close, structural readback, CRC and rename; `sync_us` is its flush/sync/close subset. These are individual observations, not latency bounds or p99 estimates. Free-stack values are runtime reports, not a qualified worst-case margin. The workers were not explicitly pinned to cores; no dual-core speedup was measured.
+
+Local artifacts live under the trial's git-ignored `build/` directory. They are not included in a Git clone; the hashes below identify the measured evidence, not a remotely published artifact bundle. Card brand/model and accessory PCB revision/population were not recorded, so do not extrapolate these results to all cards or M134 revisions:
+
+- `parquet-readback/f1179d54856fa20c31038836e5ec177e-7-66-1.parquet`: CRC32 `785aa6d0`; SHA-256 `317080e640485265258462bae724d8095916368d19a66c6919e18c86c213d4e3`. `parquet-ten-minute.log` contains 56 row reports whose sequence/monotonic timestamps match their stored rows; independently refreshed display measurements were not used as exact-value comparisons.
+- `output/station=53315f5f-cb85-4d8d-b623-d56266084189/year=2026/month=09/day=08/data_1830_c838cf99f4a1e867ebec9e2752bad519_0-2-0.parquet`: CRC32 `ce4bb0b8`; SHA-256 `ad0b32e81b233a68a867e31df8db45222dacf4a137ea3a244390389ee53bfd51`. Capture: `hive-first.log`.
+- Restart capture/readback: `hive-restart.log`, boot `1491409bed013e1999dc4072ac91ab0f`, unsynced-file CRC32 `25a3b7f7`.
+- Current flashed application binary SHA-256: `5227a989df0a9b3264117e773d3bc8a54c235a2f83d1e54037ab8966fab2c4b9`. Earlier 72-column application SHA-256: `9d5684465ec639c59fac19fa72ccb37c5429b97f22334eba6a29ee08f00a303f`.
+
+Separately, **host-only** `pixi run parquet-test --sanitize` passed empty, one-row, 90-row × 96-column and 65,536-row fixtures, including exact integer boundaries, nulls and IEEE float edge cases, with both readers and address/undefined-behavior sanitizers. These tests do not establish device performance or SD failure behavior.
+
 ## Measured facts that changed how we work
 
 - **Do not force a high baud on this board.** Reading the full 16 MB at the esptool default succeeded in **97 seconds**, about 1382 kbit/s. The same read with `--baud 921600` aborted at roughly 1.8 percent with `Serial data stream stopped, possible serial noise or corruption`, and wrote no file. The transport here is native USB-Serial/JTAG, so the requested baud buys nothing and costs reliability. The `backup` and `restore` tasks therefore pass no `--baud`.
@@ -63,6 +97,7 @@ The PMS frame reported atmospheric PM1, PM2.5 and PM10 values of 19, 24 and 26 �
 
 - **A board in download mode is silent, and that is normal.** Held in the ROM download bootloader the board enumerated fine, answered `esptool chip-id` and `flash-id` every time, yet returned zero bytes on the CDC port across two attempts, including after a DTR and RTS reset pulse and a REPL interrupt. No application is running there, so there is nothing to print. Do not read that silence as a failed board. `pixi run capture` reports this case explicitly rather than hanging.
 - **Physical RST re-enumerates USB.** macOS removed and recreated the serial device after a short press. The bounded capture helper now reconnects during its timeout.
+- **Serial open can reset this native-USB board.** The initial Parquet host helper deasserted both DTR and RTS and caused an unwanted reset on each open, losing buffered rows. Keeping both asserted and clearing POSIX HUPCL preserved boot identity and buffered sequences across separate status, flush and fetch operations on this macOS/CoreS3 pair. Other hosts/adapters remain unqualified.
 - **Do not scan reserved I2C addresses on ESP32-S3.** Probing `0x01` stopped the first diagnostic. Restricting the scan to `0x08` through `0x77`, as M5Unified itself does, completed and found all nine expected devices.
 - **A blank core-dump partition logs one checksum error.** The first boot after flashing reported an expected stored checksum of `0xffffffff` from the unused partition; the application then completed normally. Keep crash diagnostics, but distinguish an empty partition from a new panic in log ingestion.
 - **`PIN_POWER_SELECTION` reads `VDD3P3_CPU`.** That is the expected setting for GPIO33 to GPIO37 on a Quad-memory board, and it is consistent with those pins being available to the onboard LCD and microSD circuits rather than consumed by Octal PSRAM.
@@ -78,11 +113,12 @@ The diagnostic detected exactly **8,388,608 bytes**, so the separate 8 MB PSRAM 
 
 Nothing below has been observed on a real board yet. Do not promote any of it into this file without a measurement.
 
-- microSD write, sync, latency, power-loss recovery and long-running coexistence with display traffic.
+- microSD power-cut recovery, injected short-write failures, card removal/full-media behavior and long-running radio/display stress. Small-batch writes, sync and readback are verified above; normal-reset retention is not a power-loss guarantee.
+- A complete automatic 90-row/15-minute batch on the current Hive image, midnight rollover and arbitrary clock corrections. Host time accuracy/drift, compression and object-storage upload.
 - Battery presence, charging behavior and current measurement with a known battery state.
 - RTC date/time validity and retention.
 - LCD page text and layout for clipping under explicit visual inspection.
-- Sustained PMSA003 sampling, warm-up behavior and optional SHT20 isolation.
+- Long-duration PMSA003 sampling, physical warm-up sufficiency and optional SHT20 isolation; the ten-minute acquisition run above is not lifetime qualification.
 - Wi-Fi, BLE, upload, OTA, watchdog and sleep behavior.
 
 Move a line out of this list only after a dated measurement records the method and result.

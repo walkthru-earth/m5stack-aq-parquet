@@ -1,6 +1,6 @@
 # m5stack-aq-parquet
 
-Air-quality logging firmware for **M5Stack CoreS3 (ESP32-S3)**. The device stores recoverable measurement segments; cloud or host tooling converts committed data to Parquet.
+Air-quality logging firmware for **M5Stack CoreS3 (ESP32-S3)**. The device generates Parquet directly from real measurements and stores finalized files on microSD. Host tools validate and retrieve those files without converting them; object-storage upload is later work.
 
 The repo can hold **more than one framework trial** against the same board, sharing one set of hardware reference docs. It runs one trial at a time, and a second is opened only when a measured result justifies it.
 
@@ -10,9 +10,18 @@ The repo can hold **more than one framework trial** against the same board, shar
 
 ## Current status
 
-The only active trial is [Arduino-ESP32 with M5Unified](firmware/arduino-m5unified/README.md), pinned to Arduino-ESP32 3.3.11, M5Unified 0.2.21 and M5GFX 0.2.28. Its diagnostic has been built and verified on the real board. The current flashed image presents all PMSA003 mass and particle-count values plus device health across three touch-navigable LCD pages and refreshes from a checksum-valid frame every 10 seconds.
+As of **2026-09-08**, the only active trial is [Arduino-ESP32 with M5Unified](firmware/arduino-m5unified/README.md), pinned to Arduino-ESP32 3.3.11, M5Unified 0.2.21 and M5GFX 0.2.28. The flashed firmware records one scalar snapshot every **10 seconds**, using a **73-column** schema with explicit nulls/status for unavailable measurements. The PMS display retains its three touch-navigable pages.
 
-The storage design uses a bounded PSRAM queue, one microSD writer, recoverable immutable segments and idempotent upload. Current C/C++ Parquet libraries are assessed in the telemetry note; direct Parquet on the S3 remains a later conformance and power-cut experiment.
+An eight-row queue feeds a separate storage task and a bounded PSRAM batch. Default rotation is **15 minutes / up to 90 rows**, configurable to **10 minutes / up to 60 rows** for the running session. The writer emits uncompressed, immutable Parquet files without an Arrow runtime. Persistent station identity and UTC-aligned Hive partitions use:
+
+```text
+output/station=<UUID>/year=YYYY/month=MM/day=DD/
+  data_HHMM_<boot>_<first>-<last>-<attempt>.parquet
+```
+
+Measured on one board/card: a full automatic 60-row batch was **28,059 bytes** and finalized in **122 ms**, with no recorded drops or missed deadlines. PyArrow and DuckDB agreed on every stored value/null. Short current-schema Hive files also passed UTC partition, quarter-hour split and normal-restart retention checks. See the dated [bench record](docs/bench-verified.md) for firmware identities, artifacts and limits; a full 90-row/15-minute hardware run is not yet recorded.
+
+**Feasibility, not production durability:** unfinished RAM rows are lost on reset; partial files are retained but not repaired. Power-cut recovery, compression, upload, cloud compaction and Iceberg are not implemented/qualified. UTC is a host-supplied estimate and must be supplied after each reboot; until then, files go under the station's `unsynced/boot=<boot>/` tree with null UTC values. Unsupported battery current and ambient temperature/humidity are null; camera/audio streams are outside this scalar trial.
 
 ## Getting started
 
@@ -20,7 +29,10 @@ The storage design uses a bounded PSRAM queue, one microSD writer, recoverable i
 pixi install
 pixi run ports     # find the board
 pixi run chip      # confirm it is an ESP32-S3, read-only
+pixi run flash-id  # confirm 16 MB flash
+pixi run efuse     # read-only security and flash-type check
 pixi run backup    # full flash image before the first write
+ls -l backup/     # confirm the image is exactly 16777216 bytes
 ```
 
 Read the "Do not brick the board" section of `AGENTS.md` before flashing anything.
@@ -30,6 +42,17 @@ Build the active firmware with `pixi run arduino-setup` and `pixi run arduino-bu
 ```sh
 pixi run arduino-flash /dev/cu.usbmodem101
 ```
+
+Then supply time and inspect the logger, using the checked port and only one serial process at a time:
+
+```sh
+pixi run parquet-device sync-time --port /dev/cu.usbmodem101
+pixi run parquet-device command --port /dev/cu.usbmodem101 'parquet status'
+pixi run parquet-device command --port /dev/cu.usbmodem101 'parquet list'
+pixi run parquet-test --sanitize
+```
+
+The [trial README](firmware/arduino-m5unified/README.md#inspect-the-live-logger) has bounded capture, flush, fetch and DuckDB query commands. Prefer its Parquet serial helper during logging: serial control-line settings caused unwanted resets in the initial host implementation and were corrected for this macOS/CoreS3 pair. Do not reset merely to read data.
 
 Firmware SDKs are not conda packages, so the project fetches them itself at pinned versions. A clean machine needs `pixi install` and then the setup task for whichever trial you are building, with no manual SDK installation. SDKs land in `$M5_TOOLCHAIN_ROOT`, default `~/.cache/m5stack-aq-parquet/toolchains`, deliberately outside the repo so git worktrees share one copy. See `docs/cores3-development.md`.
 

@@ -10,7 +10,7 @@ firmware/
   <framework>-<variant>/   one self-contained trial, own build system and lockfile
   common/                  optional shared code, consumed as a component
 docs/                      shared, framework-neutral hardware and design references
-tools/                     host-side scripts (log parsing, Parquet conversion)
+tools/                     host scripts: device readback, Parquet validation, logs
 backup/                    flash images taken before writes, git-ignored
 ```
 
@@ -35,6 +35,7 @@ Trial directory names state the framework first, for example `firmware/idf-cpp/`
 | Toolchain, framework choice, library versions, memory, driver ownership | `docs/cores3-development.md` |
 | Wi-Fi, BLE, ESP-NOW, channels, coexistence | `docs/cores3-wireless.md` |
 | microSD, shared SPI bus, logging, power-loss recovery | `docs/cores3-storage.md` |
+| Measurement schema, Parquet, Hive partitions, clocks, future upload | `docs/telemetry-pipeline.md` |
 | Attaching any Unit, Module, Base, or third-party peripheral | `docs/addons.md`, then the matching `docs/addon-*.md` |
 | PM2.5 air-quality module (M134 / PMSA003) | `docs/addon-air-quality.md` |
 | Whether a board claim is measured or only source-checked | `docs/bench-verified.md` |
@@ -79,9 +80,21 @@ Further rules.
 
 If a capture returns nothing, the board is most likely sitting in the ROM download bootloader, which prints nothing at all. Confirm with `pixi run chip`, which still answers there.
 
+During an active Parquet run, prefer `pixi run parquet-device capture --port <port> --seconds <n>` and the helper's `command`, `fetch` and `bench` operations. Allow only one process to own the port. On the measured macOS/CoreS3 pair, deasserting both DTR and RTS reset the board; this helper keeps both asserted and clears POSIX HUPCL. A successful `chip` operation is read-only to flash but can reset the running application on exit: do not use it as a harmless live-status probe. Use `parquet status` instead. See the trial README for exact commands and the bench record for the host-specific evidence.
+
+## Parquet logging guardrails
+
+- Preserve the 10-second monotonic sampling deadline, sensor validity/nulls and visible drop/error counters. Display refreshes are separate snapshots, not exact-value references for stored rows.
+- One storage worker owns filesystem access after startup; display and SD share an application mutex, with display DMA completed before unlock. Do not infer safe concurrent SPI access or measured speedup from the presence of two cores.
+- Keep station identity in NVS and the UTC Hive path contract. Unsynchronized time stays null and uses the `unsynced` tree; do not fabricate dates or silently rewrite previous rows after a clock update.
+- Finalized Parquet files are immutable. Retain `.partial` files; no automatic formatting, recovery, retention deletion or upload is implemented. RAM-only batching can lose the unfinished batch on reset, and a normal-reset readback does not prove power-cut durability.
+- Keep the earlier 72-column/60-row measurement distinct from current 73-column Hive checks. A 90-row host fixture is not a full 15-minute hardware test. Compression and radio/upload benchmarks remain future work.
+
 ## Code quality gates
 
 `pixi run fmt`, `pixi run fmt-check`, `pixi run lint` (cppcheck over `firmware/`), `pixi run hooks` to install pre-commit.
+
+For writer/schema or readback changes, also run `pixi run parquet-test --sanitize` and proportionate SD readback tests. The format tasks select Git-tracked C/C++ files; run clang-format explicitly on newly created, untracked sources too. Keep generated binaries, captures and readback files in the trial's git-ignored `build/` directory, and record their identities/hashes in `docs/bench-verified.md` when using them as evidence.
 
 ## Hard rules
 

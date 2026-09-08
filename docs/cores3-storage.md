@@ -1,6 +1,6 @@
 # CoreS3 microSD and logging
 
-[Router](README.md) · Read for the **built-in slot**, shared SPI, file logging or data export. Card presence is optional. Source snapshot **2026-09-08**; one card mount is bench-verified, while writes and power-loss behavior remain untested.
+[Router](README.md) · Read for the **built-in slot**, shared SPI, file logging or data export. Card presence is optional. Snapshot **2026-09-08**; automatic 60-row Parquet batching, short Hive-file readback and normal-restart retention are bench-verified on one card. Power-loss behavior remains untested.
 
 ## Wiring and ownership
 
@@ -10,7 +10,7 @@
 | Display sharing | LCD CS3; SCK36/MOSI37 shared. **GPIO35 is LCD DC while CS3 is low, and SD MISO while CS3 is high**. M5GFX switches its direction; a generic always-output LCD DC driver causes contention. [CoreS3 panel implementation][gfx] |
 | SPI host | M5GFX's CoreS3 configuration uses `SPI2_HOST`; do not drive the same wires through another host or independently reinitialize its peripheral state. [Tagged configuration][gfx] |
 | Power / detect | AXP2101 **ALDO4 = 3.3 V** powers the card; `TF_SW` is AW9523 **P0_4**, not an ESP GPIO. Board power/expander setup is required; see [hardware](cores3-hardware.md). [Power setup][power] |
-| Capacity | M5 lists **16 GB maximum**. This board mounted one nominal 32 GB SDHC card and reported 31,457,280,000 bytes, which proves that card can mount but does not qualify power-loss behavior or every larger card. Keep M5's figure as the general support envelope and record larger tested card models separately. [Board specification][board], [measured](bench-verified.md) |
+| Capacity | M5 lists **16 GB maximum**. This board mounted one nominal 32 GB SDHC card, reported 31,457,280,000 bytes and passed the bounded Parquet write/readback tests. That does not qualify power-loss behavior or every larger card; the card's exact model was not recorded. Keep M5's figure as the general support envelope. [Board specification][board], [measured](bench-verified.md) |
 
 ## Bring-up paths
 
@@ -22,15 +22,29 @@
 
 ## Concurrent logging design
 
-The record, segment, upload and Parquet decisions live in the [telemetry pipeline](telemetry-pipeline.md). This file owns the physical SD and filesystem constraints.
+The record, Parquet lifecycle, optional recovery spool and later upload decisions live in the [telemetry pipeline](telemetry-pipeline.md). This file owns the physical SD and filesystem constraints.
 
 - Give storage one worker and a bounded queue. Serialize display/SD bus access with a common application mutex; complete display DMA and end any held display transaction before SD access. Keep each bus hold short; release before waiting for network or sensor work. A task per core does not make shared wires concurrent.
 - Start with batched sequential writes, e.g. 4–16 KiB in 512-byte multiples, then measure worst-case write/sync latency. Keep DMA staging internal/aligned; PSRAM can hold backlog if the driver copies safely. Size the queue from measured stalls and record dropped samples. FatFs sector-aligned multi-sector I/O reduces overhead. [FatFs performance notes][appnote]
 - Use `FILE_APPEND` for Arduino append; `FILE_WRITE` is truncating write mode. Check returned byte counts and errors. For C use explicit append/create semantics and handle short writes. [Arduino FS definitions][fs]
 - Set a durability interval in time/bytes: C `fflush(FILE*)` **then** `fsync(fileno(FILE*))`, Arduino `File.flush()`, or raw FatFs `f_sync`. Check the APIs that return status. Flushing reduces the loss window; it does not make FAT transactional or guarantee survival of the card controller's own power loss. [FatFs synchronization][sync], [Arduino flush implementation][vfs]
-- Application format recommendation: sequence ID + monotonic acquisition time + UTC/time-valid flag + schema/units + length/CRC; rotate bounded files well before FAT32's **4 GiB − 1 byte** file limit. On restart recover complete records and report a partial tail. Avoid rewriting the entire dataset per sample. [FAT limits/power interruption][appnote]
+- Implemented application format: one scalar measurement row every 10 seconds, a bounded PSRAM batch and an eight-row producer queue. A small C++ writer emits uncompressed Parquet without Arrow, with default 900-second rotation configurable to 600 seconds for the running session. With a supplied UTC estimate, batches split at aligned windows and clock-epoch changes; full windows contain at most 90/60 rows. Publish after footer, `fflush`, `fsync`, close and structural readback checks; PyArrow/DuckDB supply full host conformance validation. Startup lists and retains `.partial` files without repair. The unfinished RAM batch is lost on reset; a recovery spool remains future work. See the [telemetry lifecycle](telemetry-pipeline.md#parquet-file-lifecycle-and-optional-recovery-spool) and [bench record](bench-verified.md) for the exact tested scope. Avoid rewriting the dataset per sample and stay below FAT32's **4 GiB − 1 byte** limit. [FAT limits/power interruption][appnote]
 - Eject/shutdown: stop producers → drain queue → sync/close → unmount (`SD.end()` / `esp_vfs_fat_sdcard_unmount`) → remove card/power. Unexpected removal becomes unavailable storage; never autoformat to recover. **Insertion/power cycling requires a quiesced display/bus and a fresh SPI-mode handshake before display traffic resumes**; startup-only `_set_sd_spimode` does not establish hotplug support. [Startup restrictions][sharing]
 - ALDO4-off alone does not isolate an inserted card: shared SPI lines/pull-ups can back-power it. Quiesce or electrically isolate the relevant signals before power-gating, then measure the rail. [Schematic p5](https://m5stack-doc.oss-cn-shenzhen.aliyuncs.com/490/Sch_M5_CoreS3_v1.0.pdf). For USB MSC export, give the host or firmware exclusive filesystem ownership.
+
+## File layout and time
+
+Card files use `output/station=<UUID>/year=YYYY/month=MM/day=DD/data_HHMM_<boot>_<first>-<last>-<attempt>.parquet`. The UUID persists in NVS; the date and window-start `HHMM` are UTC. The suffix distinguishes shortened batches, reboot sessions and clock corrections without overwriting existing files. Firmware accesses the card through `/sd`, so its absolute path begins `/sd/output/`. See [the telemetry layout](telemetry-pipeline.md#upload-and-cloud-layout) for time/identity semantics.
+
+UTC is supplied explicitly with `pixi run parquet-device sync-time --port <port>` or the bench helper's `--sync-time`; it is a host estimate, not a validated RTC/NTP clock. Until then, files remain under `output/station=<UUID>/unsynced/boot=<boot>/`, with null UTC columns. Subsequent clock updates create a new clock epoch and split the batch without changing previous rows. Object-storage upload, cloud compaction and Iceberg are later work; finalized SD files are retained locally.
+
+### Lessons from the SD run
+
+- Write new files exclusively; a simple `data_0900.parquet` basename would collide after a manual flush, restart or clock correction in the same window. Keep the boot/sequence/attempt suffix and do not append to finalized Parquet. Window/epoch transitions are processed when the next sample reaches the worker, not by a separate wall-clock alarm.
+- The 60-row uncompressed file was 28,059 bytes; finalization took 122,041 µs, including 13,317 µs in flush/sync/close. These are single-run values, not worst-case card latency. Keep acquisition queued independently and remeasure under load. Exact image/schema and timings belong in the [bench record](bench-verified.md#board-1-on-device-parquet-and-hive-partitions).
+- `PAR1`, footer bounds, size and whole-file CRC checks establish structural completion/readback integrity, not complete Parquet semantics, page-level checksums or power-loss safety. Both independent host readers were also used; normal-reset byte retention was tested separately.
+- A failed write retains its batch in RAM; subsequent samples can be dropped and counted until a successful explicit retry. Old `.partial` files remain untouched. Neither failure recovery nor graceful eject is implemented as a user command; `parquet flush` alone does not stop producers or unmount the card. Do not remove it while the logger runs.
+- Finalized-file retention and unfinished-row durability are different: an accidental host-induced reset already demonstrated RAM loss. The proposed recovery spool is not present, and the card was not power-cut, removed or filled during these tests. Preserve earlier files and avoid autoformatting while diagnosing a failure.
 
 ## Lookup / verification triggers
 
@@ -38,7 +52,7 @@ The record, segment, upload and Parquet decisions live in the [telemetry pipelin
 | --- | --- |
 | Mounts intermittently | FAT vs exFAT, ALDO4 rail, TF_SW, GPIO35 direction, CS3/4, SPI clock, add-on loads; test a cold power cycle, not only software reset. |
 | Slow or unstable logger | `CONFIG_FATFS_IMMEDIATE_FSYNC`, per-file cache, `max_files`, allocation unit, `disk_status_check_enable`; [FatFs options][fatfs]. Measure latency percentiles while UI, BLE and Wi-Fi upload are active. |
-| Large exports | Stream closed files in bounded chunks; checkpoint upload acknowledgements independently. If Parquet is needed, assess a host-side converter first; embedded writers must budget row groups, encoding and footer finalization. [Parquet format](https://parquet.apache.org/docs/file-format/). |
+| Large exports | Validate device-generated Parquet on the host, then stream finalized files in bounded chunks for later object-storage upload; checkpoint acknowledgements independently. Budget row groups, encoding and footer finalization on the device. Cloud conversion is not a prerequisite; compaction/Iceberg can follow later. [Parquet format](https://parquet.apache.org/docs/file-format/). |
 | Acceptance | Write/read/CRC check across rotations; full-card, removal/reinsert and power interruption during write/sync; verify previous files survive and queue overflow is observable. Record card model/capacity/filesystem and SDK versions. |
 
 [m5-sd]: https://docs.m5stack.com/en/arduino/m5cores3/sdcard

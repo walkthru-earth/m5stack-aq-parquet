@@ -1,6 +1,7 @@
 #include <SD.h>
 #include <SPI.h>
 
+#include "telemetry_logger.h"
 #include <M5Unified.h>
 
 #include <Arduino.h>
@@ -626,6 +627,7 @@ void draw_device_page() {
 }
 
 void show_pms_screen() {
+  telemetry::lock_display();
   M5.Display.setRotation(1);
   M5.Display.fillScreen(TFT_BLACK);
   M5.Display.setTextColor(TFT_WHITE, TFT_BLACK);
@@ -644,6 +646,8 @@ void show_pms_screen() {
     draw_device_page();
   }
   draw_screen_footer();
+  M5.Display.waitDMA();
+  telemetry::unlock_display();
 }
 
 void handle_touch_navigation() {
@@ -714,6 +718,7 @@ void setup() {
   report_rtc_imu_touch();
   sd_mounted = report_sd();
   start_pms();
+  telemetry::begin_logger(sd_mounted);
   show_pms_screen();
   last_display_ms = millis();
   Serial.println("DIAG COMPLETE schema=cores3-bringup-v1");
@@ -722,6 +727,24 @@ void setup() {
 void loop() {
   M5.update();
   poll_pms();
+  telemetry::PmsSnapshot sample;
+  sample.present = has_pms_frame;
+  sample.age_ms = millis() - latest_pms_ms;
+  sample.frames = pms_frame_count;
+  sample.checksum_errors = pms_parser.checksum_failures();
+  sample.length_errors = pms_parser.length_failures();
+  sample.firmware = latest_pms_frame.firmware_version;
+  sample.error = latest_pms_frame.sensor_error;
+  sample.values[0] = latest_pms_frame.cf1_pm1;
+  sample.values[1] = latest_pms_frame.cf1_pm25;
+  sample.values[2] = latest_pms_frame.cf1_pm10;
+  sample.values[3] = latest_pms_frame.atmospheric_pm1;
+  sample.values[4] = latest_pms_frame.atmospheric_pm25;
+  sample.values[5] = latest_pms_frame.atmospheric_pm10;
+  for (std::size_t index = 0; index < 6; ++index) {
+    sample.values[index + 6] = latest_pms_frame.particle_counts[index];
+  }
+  telemetry::poll_logger(sample);
   handle_touch_navigation();
   const std::uint32_t now = millis();
   if (static_cast<std::uint32_t>(now - last_display_ms) >= kDisplayIntervalMs) {

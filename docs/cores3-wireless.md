@@ -1,7 +1,9 @@
 # CoreS3 wireless: constraints and tuning
 
-Load for Wi-Fi/BLE/ESP-NOW design or debugging. Verified 2026-09-06; target **ESP32-S3**.
+Load for Wi-Fi/BLE/ESP-NOW design or debugging. Source-checked 2026-09-06; implementation scope updated 2026-09-08; target **ESP32-S3**. No radio workload has been bench-verified in this project.
 SDK/library pins: [development](cores3-development.md). Linked `stable` guides currently describe IDF 6.1; select the installed SDK version before copying APIs/Kconfig.
+
+The current trial logs Parquet to SD without Wi-Fi, BLE, ESP-NOW, NTP or object-storage upload. Its UTC comes from an explicit USB host command, not a network clock. Separate acquisition/storage tasks and available internal heap do not establish headroom under TLS/radio traffic or a dual-core speedup. When upload is added, preserve immutable file identities, read SD in bounded chunks, release the display/SD mutex before network waits, and remeasure jitter, drops and memory under reconnect/coexistence load. The acknowledgement/retention design is still planned in the [telemetry pipeline](telemetry-pipeline.md#upload-and-cloud-layout).
 
 ## Radio and channel model
 

@@ -1,24 +1,28 @@
 # Sensor telemetry, Parquet and cloud pipeline
 
-[Router](README.md) · Read for the measurement record, near-time buffer, durable segments, upload protocol, Parquet conversion and cloud table design. Hardware-level SD rules remain in [CoreS3 storage](cores3-storage.md). Research snapshot: **2026-09-08**.
+[Router](README.md) · Read for the measurement record, bounded buffer, on-device Parquet, SD durability and later object-storage upload. Hardware-level SD rules remain in [CoreS3 storage](cores3-storage.md). Implementation snapshot **2026-09-08**; measured runs belong in [bench-verified](bench-verified.md), separately from planned validation.
 
 ## Current decision
 
-The CoreS3 should use a **store-and-forward pipeline**:
+The active Arduino/C++ trial now **generates Parquet on the CoreS3 and stores it on SD**. It acquires one row every **10 seconds**, containing available scalar measurements and explicit validity/status fields. Rotation defaults to **900 seconds** and can be set to **600 seconds** for the running session; reboot restores 900 seconds. The logger buffers up to 90 rows per file:
 
 ```text
-sensor parsers -> bounded PSRAM queue -> one SD writer -> immutable raw segments
-                                                        |
-                                                        v
-                                      idempotent HTTPS upload
-                                                        |
-                                                        v
-                            object storage -> Parquet conversion -> Iceberg table
+10-second rows -> bounded PSRAM batch -> Parquet writer -> finalized SD files
+                                                               |
+                                                               v
+                                                later idempotent HTTPS upload
+                                                               |
+                                                               v
+                                                    object storage / queries
 ```
 
-Parquet is the analytics format in object storage. The first durable device format is a small, versioned append journal that can recover a valid prefix after power loss. This keeps the microcontroller responsible for acquisition and durability while Arrow runs where its memory footprint, dependencies and file-repair tools fit.
+At this cadence, complete 10- and 15-minute windows contain 60 and 90 rows respectively when no samples are missed. The implementation uses a PSRAM row batch, an eight-row producer queue and a small C++ Parquet writer with no Arrow runtime. Sampling continues into that queue while the storage worker finalizes the batch. Boot, explicit flush, interval changes and clock changes can produce shorter files.
 
-No mature, production-proven Parquet writer currently targets ESP32-S3. A direct writer remains a useful later experiment, but it must pass host conformance and repeated power-cut tests before it can replace the journal.
+File rotation and reset durability are separate choices. The implemented baseline loses its unfinished RAM batch after reset. It lists and retains `.partial` files on startup without attempting repair. A small SD recovery spool remains a later option if the required loss window is shorter than one rotation. Finalized-file survival still requires power-cut tests before a production durability claim. A real 60-row automatic batch and shorter current-schema Hive files have been read back from SD and opened with both PyArrow and DuckDB. UTC partition agreement, a quarter-hour split and station/file retention across a normal restart were checked separately; a complete 90-row/15-minute run is not yet measured. See [bench-verified](bench-verified.md) for exact firmware, schema and run details.
+
+The motivating [ESP32-S3 Rust trial](https://github.com/walkthru-earth/esp32s3-parquet-test/tree/1f3a6c706f85d54a0abe3105b2eed4c6378d814d) uses the Apache Rust Parquet crate with default features/Arrow disabled and `snap` enabled; its lockfile resolves **56.2.0**. The audited source generates 178 synthetic rows and ten columns, builds a complete in-memory file including its footer, and uploads the bytes. It does not implement SD persistence, continuous real-sensor acquisition or power-loss recovery, and the reviewed checkout contains no independently verifiable device-memory captures or generated-file artifacts. Its documented Zstd comparison is a macOS experiment. This is credible implementation evidence for investigating device-side Parquet, not a CoreS3 benchmark. [Dependencies](https://github.com/walkthru-earth/esp32s3-parquet-test/blob/1f3a6c706f85d54a0abe3105b2eed4c6378d814d/Cargo.toml), [writer](https://github.com/walkthru-earth/esp32s3-parquet-test/blob/1f3a6c706f85d54a0abe3105b2eed4c6378d814d/src/main.rs#L266), [host comparison](https://github.com/walkthru-earth/esp32s3-parquet-test/blob/1f3a6c706f85d54a0abe3105b2eed4c6378d814d/index.md#L591).
+
+Object-storage synchronization follows local file validation. Apache Iceberg is explicitly deferred; plain Parquet files can be uploaded and queried without a table catalog.
 
 The active Arduino trial stays active. [ESP-IDF 6.1](https://github.com/espressif/esp-idf/releases/tag/v6.1) is newer than the ESP-IDF 5.5.5 base inside Arduino-ESP32 3.3.11, but that alone does not justify a second trial. Start an IDF trial only after this implementation produces a measured driver, latency, memory or component limitation and record that finding in the trial README.
 
@@ -28,24 +32,31 @@ Every sample has an identity independent of wall-clock quality. Never turn a tim
 
 | Field | Requirement |
 | --- | --- |
-| `schema_version` | Unsigned integer; old decoders reject unsupported major versions cleanly. |
-| `device_id` | Stable opaque identifier, provisioned separately from a human-readable name. |
-| `boot_id` | Random 128-bit value generated once per boot. |
-| `sequence` | Monotonic 64-bit counter within one boot; `device_id + boot_id + sequence` is the row identity. |
+| `schema_version` | INT32 version 1; file metadata identifies `cores3-telemetry-v1`. Readers must check the actual schema as fields are added during feasibility work. |
+| `station_id` | UUID generated once and persisted in NVS (`parquet` namespace, `station` key); carried in file metadata and the Hive directory, not repeated as a numeric row column. Erasing NVS creates a new station identity. |
+| `device_id` | INT64 containing the board's 48-bit Wi-Fi station MAC; a hardware identifier, not an anonymized UUID. |
+| `boot_id_hi`, `boot_id_lo` | Two INT64 fields carrying a random 128-bit identifier generated once per boot. |
+| `sequence` | Monotonic INT64 counter within one boot; device, boot and sequence identify the row. Missed sample deadlines create observable sequence gaps. |
 | `monotonic_us` | Acquisition time from the monotonic clock; always present. |
-| `event_time_utc_ns` | Nullable UTC estimate. It is absent until time is trusted. |
-| `clock_status` | Unsynced, estimated or synchronized, plus a clock epoch so time steps are visible. |
+| `event_time_utc_ns` | Nullable INT64 UTC estimate in nanoseconds, with units explicit in the name; no Parquet timestamp logical annotation yet. Absent until the host explicitly supplies UTC. |
+| `clock_status`, `clock_epoch` | Status 0 = unsynchronized, 1 = host estimate. Epoch increments at each supplied time anchor; files split when it changes. No measured clock-uncertainty bound or synchronized status is claimed. |
 | Measurements | Fixed-width typed fields with units in the schema, not encoded into display strings. |
 | Validity | Per-sensor status and validity bits; preserve missing, warming, stale, checksum error and device error distinctly. |
-| Provenance | Firmware build, board revision, sensor firmware, configuration version and calibration identifier. |
+| Provenance | File metadata records firmware, board, station, boot, cadence, status meanings and known unavailable measurements. Calibration/configuration versioning is future work. |
 
-Time synchronization writes an anchor record containing monotonic and UTC time plus uncertainty. Already-buffered samples are not rewritten merely because UTC later becomes available; the cloud can apply the anchor deterministically.
+Use `pixi run parquet-device sync-time --port <port>` to explicitly supply this host's current UTC estimate, or `--sync-time` with `parquet-device bench`. The serial `parquet time <epoch-seconds>` command anchors that value to the device monotonic clock and reports the anchor. This is not NTP and does not set or trust the RTC calendar; command/transport latency and host error are not measured. Previously buffered rows retain their original timestamps and epoch. Persisting a separate uncertainty-bearing anchor journal is future work.
 
-The first PMS schema carries both atmospheric and CF=1 PM1.0/PM2.5/PM10 values, all six cumulative particle-count channels, the PMS sensor-error byte and framing/checksum counters.
+The anchor uses the command's monotonic receipt time, not the later time at which the storage worker handles it. This avoids adding worker-queue delay to the clock mapping, but host integer-second truncation and USB latency remain. Station UUID persists across normal resets; the UTC anchor, clock epoch and runtime interval choice do not. A new host time must be supplied after reboot. Source: [current logger](../firmware/arduino-m5unified/bringup/telemetry_logger.cpp).
 
-## Recoverable segment format
+The current schema has **73 numeric columns**, including the clock epoch. PMS fields include atmospheric and CF=1 PM1.0/PM2.5/PM10, six cumulative particle-count channels, sensor error and framing/checksum counters. Onboard fields cover IMU readings, raw magnetic counts, raw LTR-553 light/proximity counts, power, RTC calendar, touch and memory/storage health. Unsupported battery current and ambient temperature/humidity remain null; camera frames and microphone audio are outside this scalar schema. Availability and conflicts are documented in [hardware](cores3-hardware.md) and the relevant accessory references. Carry source age/status when a row snapshots a sensor whose acquisition cadence differs from 10 seconds; these snapshots are not interval averages.
 
-Version 1 is intentionally small and manually serialized with explicit byte order. It does not write a native compiler struct or rely on padding.
+## Parquet file lifecycle and optional recovery spool
+
+The storage worker creates a uniquely named `.partial` file exclusively, completes column pages and the footer, checks write counts, calls `fflush` and `fsync`, and closes it. It then reads the file back to check length, leading/trailing `PAR1` and footer bounds, and computes a whole-file CRC32 before renaming to `.parquet`. This structural check is not a full Parquet decoder: PyArrow and DuckDB perform host conformance validation. Only finalized files are eligible for later upload; never append rows to one. At boot the current implementation lists both suffixes and retains partial files without repair. FAT rename is not assumed crash-atomic, and automatic formatting is disabled.
+
+The RAM-only baseline makes the unfinished batch expendable and reports that limitation. A recovery spool is an optional subsequent durability feature. If selected, version 1 should use the record and lifecycle below; keep it distinct from the primary Parquet export format.
+
+Serialize the spool manually with explicit byte order. It does not write a native compiler struct or rely on padding.
 
 Each record has:
 
@@ -58,7 +69,7 @@ Each record has:
 
 Wrap the ESP-IDF CRC API and test it against host-generated known vectors. Its seed, continuation and final inversion rules are easy to apply incorrectly.
 
-The final segment trailer records first and last sequence, record count, byte count and SHA-256 of the committed content. CRC catches a damaged record during streaming recovery; SHA-256 gives the uploader and cloud endpoint a stable content identity.
+The final spool trailer records first and last sequence, record count, byte count and SHA-256 of the committed content. CRC catches a damaged record during streaming recovery; a separate SHA-256 over the finalized Parquet file gives the later uploader a stable content identity.
 
 Use this lifecycle:
 
@@ -66,41 +77,47 @@ Use this lifecycle:
 2. append complete records through one storage worker;
 3. batch writes in 4–16 KiB, keeping the DMA staging buffer in internal RAM;
 4. at a durability boundary, check the write count, call `fflush`, then `fsync`;
-5. rotate on time or size, initially 10 minutes or 512 KiB;
+5. rotate on the configured Parquet batch boundary or a bounded size;
 6. write and sync the trailer, close, validate the file, then rename it `.ready`;
-7. upload only `.ready` files;
-8. delete only after an acknowledgement matches both size and SHA-256.
+7. build and validate the corresponding immutable Parquet file locally;
+8. retire the spool only after that Parquet file is durable under the tested recovery policy.
 
 FAT rename is not assumed to be crash-atomic. At boot, scan both suffixes, validate complete records, recover the longest valid prefix of an `.open` file, and quarantine anything ambiguous. Never autoformat after a mount or recovery failure. Keep upload acknowledgements in a separate small journal so a reset cannot confuse “sent” with “durably accepted.”
 
-An uncompressed journal is the baseline. Sensor data rates are low enough that predictable recovery matters more than early compression. Measure SD bytes, upload bytes, CPU time and energy before adding a codec.
+An optional spool can remain uncompressed. Measure complete Parquet bytes, CPU time and peak working memory before choosing its page codec; compression is independent of whether a spool is present.
 
 ## Memory, tasks and backpressure
 
 - Sensor code parses into typed records and never writes the filesystem directly.
-- A bounded queue in the verified 8 MB Quad PSRAM absorbs SD and network stalls. Capacity comes from a measured stall budget; allocation failure is a reported state.
+- The 90-row batch and writer workspace reside in the verified 8 MB Quad PSRAM. An eight-row FreeRTOS queue absorbs brief storage stalls; it is allocated by FreeRTOS, not explicitly in PSRAM. Allocation failure disables logging with an error. Queue sizing is still a feasibility choice, not a qualified stall budget.
 - One storage task owns FatFS and all SD transactions. It shares the SPI2 bus with the display through one application lock and never waits for network work while holding that lock.
-- DMA descriptors and a reusable 4–16 KiB sector-aligned SD staging buffer stay in internal DMA-capable RAM. Preserve an internal-memory reserve rather than letting general allocation consume it.
-- A separate uploader reads only closed segments. Sampling continues offline until the retention limit is reached.
-- Queue-full and card-full policy is explicit. Count lost records and emit a gap record when storage resumes; never silently overwrite unsent data.
+- The writer streams through a 4 KiB stdio buffer on the storage task's internal stack. SD driver staging/DMA remain driver-owned; the application buffer is not advertised as a direct DMA allocation.
+- A separate later uploader will read only finalized Parquet files. No retention deletion or object-storage synchronization is implemented yet.
+- Queue overflow counts dropped rows. A write failure retains the batch, reports the failure and drops subsequent rows until an explicit flush succeeds; absent storage also counts drops. There is no automatic retry, gap-record journal, hotplug recovery or deletion of older files.
 
-Record sample jitter, queue high-water mark, drops, internal and PSRAM minimum free space, SD write p50/p99/max latency, sync latency, segment recovery count and upload retry count.
+Record sample jitter, queue high-water mark, drops, internal and PSRAM minimum free space, writer time, file bytes/row, SD write p50/p99/max latency, sync latency, incomplete-file count and, once implemented, recovery and upload retry counts. Label measurements by firmware build, configuration, sample count and card model; keep measured results in [bench-verified](bench-verified.md).
 
 ## Upload and cloud layout
 
-Use HTTPS for immutable segment transfer. A stable object key can include schema version, device ID, boot ID, sequence range and digest:
+The SD layout already uses the requested Hive partition directories, ready to preserve as object keys when upload is added. UTC-dated files use:
 
 ```text
-raw/v1/device_id=<id>/boot_id=<id>/<first>-<last>-<sha256>.seg
+output/station=<UUID>/year=YYYY/month=MM/day=DD/data_HHMM_<boot>_<first>-<last>-<attempt>.parquet
 ```
 
-Create-only semantics such as `If-None-Match: *` make retries idempotent. After a timeout, query or retry the same key; never invent a new identity for the same bytes. The endpoint verifies length, SHA-256, record CRCs, sequence range and schema version before acknowledging.
+`HHMM` identifies the start of the UTC-aligned 10- or 15-minute window, not the upload time. The boot, sequence-range and attempt suffix prevents distinct files in the same window from overwriting each other after reboot, manual flush or a clock correction. The extension remains `.parquet`; the interval is configuration, not an extension suffix. New windows, midnight and clock-epoch changes split batches. Startup mid-window produces a short first file. Firmware paths include the `/sd` mount prefix; the card/object path starts at `output/`.
+
+The worker detects window/epoch changes on arrival of the next sample; there is no independent wall-clock finalization alarm. A `READY` line proves that one file finalized, not that a full configured window was collected. In particular, `bench --sync-time --until-ready` may retrieve the old unsynced or shortened batch closed by the new anchor. Check row count, sequence range and timestamps before labeling a run a full 10/15-minute test.
+
+Before the host supplies time, rows have null UTC and files go to `output/station=<UUID>/unsynced/boot=<boot>/data_unsynced_<boot>_<first>-<last>-<attempt>.parquet`. They are not assigned a guessed calendar date or retroactively renamed when time becomes available. Date-partition queries must explicitly decide whether and how to include this separate unsynchronized tree.
+
+For the later HTTPS uploader, create-only semantics such as `If-None-Match: *` make retries idempotent. After a timeout, query or retry the same finalized key; never invent a new identity for the same bytes. Stream bounded reads from SD, releasing the shared-bus lock before network waits. The ingestion endpoint should verify length, SHA-256, readable Parquet metadata/pages, sequence range and schema version before acknowledging; delete local files only after a persistent acknowledgement matches size and digest. SHA-256 and acknowledgement persistence are not implemented by the current CRC32 serial-readback helper.
 
 MQTT QoS 1 can carry live gauges, alarms and device health. It is not the durable measurement source because duplicates and reconnect gaps are normal. Deduplicate any live copy by the same row identity.
 
-The ingestion service retains raw segments, converts validated records to Parquet with Apache Arrow/PyArrow, and writes immutable data files. Partition by event day and a device bucket after observing query patterns; avoid one tiny Parquet file per device segment. Compact small files and commit them through an Apache Iceberg table so schema evolution, late data and atomic snapshot publication happen in the cloud.
+The ingestion service can accept the device's finalized Parquet directly. Uninterrupted ten-/fifteen-minute rotation produces 144/96 files per station per UTC day; extra splits produce more. Cloud compaction can follow as fleet size and query costs warrant. Apache Iceberg catalog and snapshot management remain later work.
 
-OpenTelemetry belongs at the gateway and ingestion services. The device emits compact counters, reset reason, firmware/config versions, RSSI, heap watermarks, queue depth, SD state and last successful upload; cloud services translate those into metrics, logs and traces.
+For later deployment, OpenTelemetry belongs at the gateway and ingestion services. The current device emits acquisition/storage counters, heap/queue health and a startup reset report; RSSI, upload success and configuration/calibration versioning are not implemented telemetry yet. Add them with networking, then translate device health into cloud metrics, logs and traces.
 
 ## C and C++ library assessment
 
@@ -109,9 +126,9 @@ These are dated observations, not floating dependencies.
 | Project | Version checked | Fit for CoreS3 |
 | --- | --- | --- |
 | [Apache Parquet format](https://github.com/apache/parquet-format/releases/tag/apache-parquet-format-2.13.0) | 2.13.0, Apache-2.0 | The wire specification. Metadata and page headers use Thrift Compact Protocol; it is not an embedded writer library. |
-| [Apache Arrow C++](https://arrow.apache.org/blog/2026/08/10/25.0.1-release/) | 25.0.1, Apache-2.0 | Production Parquet implementation for host/cloud. Its C++20 build and Arrow/Thrift dependency graph are unsuitable for this microcontroller. |
+| [Apache Arrow C++](https://arrow.apache.org/blog/2026/08/10/25.0.1-release/) | 25.0.1, Apache-2.0 | Production Parquet implementation for host/cloud. Its full runtime/dependency graph is not the proposed firmware writer; its footprint does not establish the cost of a bounded Parquet-only implementation. |
 | [nanoarrow](https://github.com/apache/arrow-nanoarrow) | 0.9.0, Apache-2.0 | C runtime compiles to a few hundred KiB and writes Arrow IPC through `FILE*`, but it does **not** write Parquet or compressed IPC. |
-| [Carquet](https://github.com/seladb/carquet/releases/tag/v0.7.0) | 0.7.0, MIT | Roughly 200 KiB C11 Parquet reader/writer candidate with custom allocators. It is pre-1.0, has no ESP32-S3 qualification and recently fixed conformance and memory-safety defects. |
+| [Carquet](https://github.com/Vitruves/carquet) | 0.7.0 in the earlier release snapshot, MIT; re-pin before integration | C11 Parquet reader/writer candidate. Upstream's roughly 200 KB binary claim is not a CoreS3 RAM measurement. Audit its build, codec dependencies and allocator requirements before selecting a firmware subset; no ESP32-S3 qualification is established here. |
 | [DuckDB](https://github.com/duckdb/duckdb/releases/tag/v1.5.5) | 1.5.5, MIT | Excellent host validator, but its database surface and roughly 125 MB per-thread memory guidance are beyond the device budget. |
 | [zcbor](https://github.com/NordicSemiconductor/zcbor/releases/tag/0.9.1) | 0.9.1, Apache-2.0 | Low-footprint C CBOR with CDDL-generated codecs, static-friendly operation and fragmented buffers. |
 | [Espressif LZ4](https://components.espressif.com/components/espressif/lz4/versions/1.10.0/readme) | 1.10.0, BSD-2-Clause/Apache-2.0 integration | Block state is about 1–16 KiB; Frame defaults need at least 64 KiB and can use PSRAM. Parquet requires raw blocks under `LZ4_RAW`, never LZ4 Frame output. |
@@ -125,25 +142,35 @@ Secondary findings: ESP-IDF's ROM `miniz.h` is a restricted legacy subset and mu
 
 ## Direct Parquet experiment
 
-Parquet allows single-pass creation because column chunks are written before the footer, but readers locate metadata from the final footer. A power cut before that footer leaves no standard file, and appending rows to a closed file requires replacing the old footer. That recovery property is the main reason it is not the first device store.
+Parquet allows single-pass creation because column chunks are written before the footer, but readers locate metadata from the final footer. A power cut before that footer leaves an incomplete file, and appending rows to a closed file requires replacing the old footer. Use immutable rotations and an explicit unfinished-batch policy.
 
-If the journal pipeline passes durability tests, a direct writer experiment is limited to:
+The current implementation in the active C/C++ trial uses:
 
 - one immutable file and one row group per rotation;
-- required primitive columns only;
+- flat INT32/INT64/FLOAT columns; the logger provides definition levels for every column, always populating identity/status fields and leaving unavailable measurements/time null;
 - PLAIN encoding and Data Page V1;
 - uncompressed pages first;
-- optional standard Parquet page CRC32;
-- `LZ4_RAW` only after uncompressed fixtures pass;
-- small, fixed page and row-group buffers with allocator limits;
-- a minimal writer-only Thrift Compact implementation or audited Carquet subset;
+- no page codec or Parquet page CRC32 yet; serial readback has a separate whole-file CRC32;
+- a fixed 90-row logger batch and bounded streaming buffers;
+- a minimal writer-only Thrift Compact implementation in `parquet_writer.cpp`, without Arrow or Carquet dependencies;
 - `.partial` -> sync -> close -> footer validation -> final rename.
 
-Every generated file must open in Arrow/PyArrow and DuckDB, preserve nulls and exact integer values, and match host-generated fixtures. Test empty, one-row, maximum-value, invalid-value, clock-unsynced and multiple-page cases. Run repeated power cuts during data, page header, footer, sync and rename. Record bytes per row, compression time, heap high-water marks, sample jitter, SD latency and recovery outcome.
+Host conformance checks use PyArrow and DuckDB, including nulls and exact integer values. Empty, one-row, boundary-value and wide/maximum-row fixtures pass the host sanitizer test; unsynced and dated files also pass real SD readback. Add multiple-page cases only if that feature is introduced. The automatic 60-row run and current Hive-schema checks are recorded separately in [bench-verified](bench-verified.md); longer runs and failure cases remain open. Benchmark Snappy, `LZ4_RAW` and low-level Zstd against identical rows next, measuring complete-file bytes, CPU time and peak working memory before selecting a codec. Separately run repeated power cuts during data, page header, footer, sync and rename before claiming recovery guarantees. The cited Zstd wrapper's memory figures are specific to its dictionary workload, not a CoreS3 budget.
 
 Do not use Parquet's deprecated `LZ4` enum, LZ4 Frame payloads, dictionaries, nested schemas, append-to-finalized files or one file per sample in the first experiment.
 
 ## Operational cases to implement
+
+### Lessons established by the feasibility work
+
+- **Format feasibility is narrower than runtime size.** The user's Rust experiment justified revisiting the earlier cloud-only recommendation. The local bounded C++ writer now has real-sensor SD evidence without importing Arrow; that does not make its limited schema support a general-purpose Parquet implementation.
+- **Measure complete files.** The first seven-row file had a 5,490-byte footer in 9,494 total bytes; the 60-row file was 28,059 bytes. Metadata overhead matters for small batches. Compare codec candidates on identical full files and distinguish finalization time from encoding-only time.
+- **Prove the bytes at each layer.** Writer fixtures, device footer/CRC readback, serial length/offset/CRC checks and independent reader comparison test different failure surfaces. A transfer CRC is neither a Parquet page checksum nor a cryptographic upload identity. Host query partition columns must be checked separately from stored schema columns.
+- **Reset, missing data and clock changes need explicit semantics.** Correct serial control-line handling stopped accidental resets; it did not make RAM durable. Null unsupported readings, unsynced paths and immutable clock epochs preserve uncertainty rather than hiding it.
+- **More cores do not remove shared-bus ownership.** A separate storage worker absorbed the tested finalization workload, with no measured reason yet to pin cores. Keep DMA completion and the common SPI lock, and remeasure before adding compression or radios.
+- **Keep evidence scoped.** The complete 60-row run used the earlier 72-column image. Current 73-column Hive files, quarter-hour splitting and normal-restart retention have their own short checks. Full 90-row hardware endurance, clock-correction stress and power-cut recovery remain open. [Dated artifacts and results](bench-verified.md#board-1-on-device-parquet-and-hive-partitions)
+
+### Remaining operational checklist
 
 [Open Air's firmware](https://github.com/Open-Air-Foundation/firmware-one-openair) was inspected only as a checklist of field cases; no source, schema, protocol or architecture was imported. Our implementation must cover:
 
@@ -160,12 +187,12 @@ Do not use Parquet's deprecated `LZ4` enum, LZ4 Frame payloads, dictionaries, ne
 
 ## Implementation order
 
-1. **Complete:** live 10-second PMS display and serial measurement report.
-2. Specify the byte-level journal and build host encode/decode fixtures.
-3. Add the bounded PSRAM queue and single SD writer.
-4. Verify recovery with forced resets and controlled power cuts.
-5. Add immutable HTTPS upload and acknowledgement retention.
-6. Convert raw segments to Parquet on the host and validate schema evolution.
-7. Measure whether device-side compression or direct Parquet provides enough benefit to justify its extra failure surface.
+1. **Implemented:** live 10-second measurement collection, bounded C++ Parquet writer, SD finalization and host conformance/readback tooling in the active Arduino trial.
+2. **Hardware readback verified:** an automatic 60-row batch and shorter current-schema Hive files open in both readers; exact scope and measured timings are in [bench-verified](bench-verified.md).
+3. **Implemented, partly bench-verified:** persistent station UUID, UTC Hive layout, clock epochs and configurable 600/900-second windows. Station persistence, normal-reset file retention, UTC partition agreement and a quarter-hour boundary split passed. Still test a full 90-row automatic window, midnight and arbitrary clock corrections.
+4. Measure actual memory, bytes/row, encoding time, SD latency and sampling jitter across longer runs and failure cases.
+5. Benchmark standard Parquet compression on the board using the same rows; choose from measured results.
+6. Implement the chosen reset-loss policy, adding a recovery spool if needed, and verify controlled reset/power-cut behavior.
+7. Add immutable HTTPS upload and acknowledgement retention. Cloud compaction and Apache Iceberg remain later milestones.
 
 Useful primary references: [Parquet file layout and recovery](https://github.com/apache/parquet-format/blob/master/README.md), [Parquet compression rules](https://github.com/apache/parquet-format/blob/master/Compression.md), [ESP-IDF FatFS behavior](https://docs.espressif.com/projects/esp-idf/en/stable/esp32/api-reference/storage/fatfs.html), [ESP-IDF filesystem resilience guidance](https://docs.espressif.com/projects/esp-idf/en/stable/esp32/api-guides/file-system-considerations.html), [ESP32-S3 heap capabilities](https://docs.espressif.com/projects/esp-idf/en/latest/esp32s3/api-reference/system/mem_alloc.html), and [Apache Iceberg specification](https://iceberg.apache.org/spec/).

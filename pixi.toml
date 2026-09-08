@@ -31,6 +31,8 @@ capture = "python tools/capture_serial.py"
 # Interactive serial terminal. Pass the port and baud, for example
 # pixi run monitor /dev/cu.usbmodem101 115200
 monitor = "python -m serial.tools.miniterm --raw"
+parquet-device = "python tools/parquet_device.py"
+parquet-test = "python tools/test_parquet.py"
 
 # --- active firmware trial: Arduino ESP32 + M5Unified ---
 arduino-setup = "firmware/arduino-m5unified/setup.sh"
@@ -42,7 +44,7 @@ arduino-flash = "firmware/arduino-m5unified/flash.sh"
 # --- host code quality ---
 fmt = "clang-format -i $(git ls-files '*.c' '*.h' '*.cpp' '*.hpp' '*.ino' 2>/dev/null)"
 fmt-check = "clang-format --dry-run --Werror $(git ls-files '*.c' '*.h' '*.cpp' '*.hpp' '*.ino' 2>/dev/null)"
-lint = "cppcheck --language=c++ --enable=warning,style,performance,portability --inline-suppr --error-exitcode=1 --std=c++23 firmware/arduino-m5unified/bringup/bringup.ino"
+lint = "cppcheck --language=c++ --enable=warning,style,performance,portability --inline-suppr --error-exitcode=1 --std=c++23 firmware/arduino-m5unified/bringup/bringup.ino firmware/arduino-m5unified/bringup/telemetry_logger.cpp firmware/arduino-m5unified/bringup/parquet_writer.cpp"
 hooks = "pre-commit install"
 
 [dependencies]
@@ -58,6 +60,8 @@ pip = ">=26.2.1,<27"
 pyserial = ">=3.5,<4"
 cppcheck = ">=2.21.0,<3"
 pre-commit = ">=4.6.2,<5"
+pyarrow = ">=25.0.0,<26"
+duckdb = ">=1.5.5,<2"
 
 [activation.env]
 # Firmware SDKs are large and are not conda packages, so the project bootstraps

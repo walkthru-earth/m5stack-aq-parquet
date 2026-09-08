@@ -1,6 +1,6 @@
 # Optional add-on integration
 
-[Router](README.md) · Read only when attaching a Unit (cable), Module (stack), Base, or third-party peripheral. CoreS3 remains the host; an accessory is never assumed to be built in. Snapshot **2026-09-06**.
+[Router](README.md) · Read only when attaching a Unit (cable), Module (stack), Base, or third-party peripheral. CoreS3 remains the host; an accessory is never assumed to be built in. Source snapshot **2026-09-06**, integration lessons updated **2026-09-08**.
 
 ## Resolve the actual connection
 
@@ -26,3 +26,9 @@ Driver discovery, on demand: [M5UnitUnified](https://github.com/m5stack/M5UnitUn
 Create `docs/addon-<name>.md` only for an accessory actually being investigated. Keep: identity/variants; supply + logic + current; host pin map/address; protocol/timing/units; CoreS3 conflicts and workable wiring; driver/version evidence; failure/recovery notes; schematic/datasheet/example links; verification date and unresolved revision differences. Generic setup APIs need only a keyword/link.
 
 Available: [M134 air-quality module / PMSA003, SHT20 when fitted](addon-air-quality.md). This is an optional accessory reference, not the definition of the project hardware.
+
+## Lessons from the first attached sensor
+
+Board 1's PMS UART path was verified through a real ten-minute Parquet batch; that does not identify every fitted chip or qualify the whole accessory. The possible SHT20/ES7210 `0x40` collision remains unresolved, and no SHT20 values are acquired. Record physical revision/population and isolation before enabling another driver; disabling microphone sampling is not electrical isolation. [Accessory evidence](addon-air-quality.md), [bench scope](bench-verified.md)
+
+Missing, warming, stale or erroring sensors must produce explicit status/nulls rather than plausible zeros. Keep sensor acquisition separate from storage and display refresh; an add-on with a slower conversion period needs its own cached value and freshness rule. Adding a field requires updating the schema, independent-reader fixtures and bench evidence without claiming that earlier files tested the new field.
