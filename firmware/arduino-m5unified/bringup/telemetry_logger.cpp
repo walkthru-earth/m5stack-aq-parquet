@@ -1,5 +1,6 @@
 #include "telemetry_logger.h"
 #include "ltr553.h"
+#include "lz4_codec.h"
 #include "parquet_writer.h"
 
 #include <Arduino.h>
@@ -141,6 +142,7 @@ struct WriterState {
   Sample rows[kMaxRows];
   Column columns[field_count];
   Workspace workspace{};
+  Lz4Workspace lz4{};
 };
 struct Command {
   char text[448]{};
@@ -164,6 +166,10 @@ std::int64_t anchor_mono_us = 0, anchor_utc_ns = 0;
 std::int32_t clock_generation = 0;
 bool mounted = false;
 bool accepting = false;
+Codec selected_codec = Codec::Uncompressed;
+const char *codec_name(Codec codec) {
+  return codec == Codec::Lz4Raw ? "LZ4_RAW" : "UNCOMPRESSED";
+}
 
 class BusLock {
 public:
@@ -312,15 +318,22 @@ bool make_directories(const char *path) {
   }
 }
 
-bool write_batch(std::size_t count) {
+bool write_batch(std::size_t count, bool benchmark = false,
+                 Codec codec = Codec::Uncompressed) {
   static std::uint32_t attempt = 0;
   if (!count)
     return true;
+  if (!benchmark)
+    codec = selected_codec;
   const auto first = writer_state->rows[0].data[sequence];
   const auto last = writer_state->rows[count - 1].data[sequence];
   char partition[160], prefix[24];
   const Sample &first_row = writer_state->rows[0];
-  if (first_row.valid[event_time_utc_ns]) {
+  if (benchmark) {
+    std::snprintf(partition, sizeof(partition), "benchmarks/boot=%s",
+                  boot_text);
+    std::strcpy(prefix, codec == Codec::Lz4Raw ? "lz4_raw" : "uncompressed");
+  } else if (first_row.valid[event_time_utc_ns]) {
     const std::int64_t seconds = first_row.data[event_time_utc_ns] / 1000000000;
     const std::time_t window =
         (seconds / rotation_seconds.load()) * rotation_seconds.load();
@@ -377,7 +390,9 @@ bool write_batch(std::size_t count) {
       {"device_id", device_text},
       {"station_id", station_text},
       {"boot_id", boot_text},
-      {"firmware", "arduino-cores3-parquet-v1"},
+      {"firmware", "arduino-cores3-parquet-v2"},
+      {"compression", codec_name(codec)},
+      {"purpose", benchmark ? "codec-comparison-duplicate-rows" : "telemetry"},
       {"board", "CoreS3 ESP32-S3 rev0.2"},
       {"sample_interval_ms", "10000"},
       {"clock", "0=unsynchronized/null,1=host estimate; RTC calendar "
@@ -392,10 +407,14 @@ bool write_batch(std::size_t count) {
                       "camera/audio not sampled"},
       {"durability",
        "RAM batch; unfinished rows lost on reset; completed files retained"}};
-  const auto result =
-      write_parquet(sink, file, writer_state->columns, field_count, count,
-                    writer_state->workspace, metadata,
-                    sizeof(metadata) / sizeof(metadata[0]));
+  writer_state->lz4.codec_us = 0;
+  auto compression = writer_state->lz4.configuration();
+  const auto writer_started = esp_timer_get_time();
+  const auto result = write_parquet(
+      sink, file, writer_state->columns, field_count, count,
+      writer_state->workspace, metadata, sizeof(metadata) / sizeof(metadata[0]),
+      codec == Codec::Lz4Raw ? &compression : nullptr);
+  const auto writer_elapsed = esp_timer_get_time() - writer_started;
   bool ok = result.ok;
   const auto sync_started = esp_timer_get_time();
   {
@@ -426,17 +445,22 @@ bool write_batch(std::size_t count) {
     return false;
   }
   ++finalized;
-  Serial.printf("PARQUET READY name=%s.parquet rows=%u first=%lld last=%lld "
-                "bytes=%lu crc32=%08lx write_us=%lu sync_us=%lu heap_free=%lu "
-                "psram_free=%lu stack_free=%u\n",
-                name, unsigned(count), static_cast<long long>(first),
-                static_cast<long long>(last), static_cast<unsigned long>(size),
-                static_cast<unsigned long>(crc),
-                static_cast<unsigned long>(write_us.load()),
-                static_cast<unsigned long>(sync_us.load()),
-                static_cast<unsigned long>(ESP.getFreeHeap()),
-                static_cast<unsigned long>(ESP.getFreePsram()),
-                unsigned(uxTaskGetStackHighWaterMark(nullptr)));
+  Serial.printf(
+      "PARQUET READY name=%s.parquet rows=%u first=%lld last=%lld "
+      "bytes=%lu crc32=%08lx write_us=%lu sync_us=%lu heap_free=%lu "
+      "psram_free=%lu stack_free=%u codec=%s codec_us=%llu "
+      "writer_us=%lld codec_workspace_bytes=%u heap_min=%lu\n",
+      name, unsigned(count), static_cast<long long>(first),
+      static_cast<long long>(last), static_cast<unsigned long>(size),
+      static_cast<unsigned long>(crc),
+      static_cast<unsigned long>(write_us.load()),
+      static_cast<unsigned long>(sync_us.load()),
+      static_cast<unsigned long>(ESP.getFreeHeap()),
+      static_cast<unsigned long>(ESP.getFreePsram()),
+      unsigned(uxTaskGetStackHighWaterMark(nullptr)), codec_name(codec),
+      static_cast<unsigned long long>(writer_state->lz4.codec_us),
+      static_cast<long long>(writer_elapsed), unsigned(sizeof(Lz4Workspace)),
+      static_cast<unsigned long>(ESP.getMinFreeHeap()));
   return true;
 }
 
@@ -454,11 +478,13 @@ bool safe_name(const char *name) {
          std::strstr(name, "//") == nullptr;
 }
 
-void list_directory(const char *relative, unsigned depth, unsigned &partials) {
+void list_directory(const char *relative, unsigned depth, unsigned &partials,
+                    const char *base = kDirectory,
+                    const char *export_prefix = "") {
   if (depth > 6)
     return;
   char directory_path[416];
-  std::snprintf(directory_path, sizeof(directory_path), "%s/%s", kDirectory,
+  std::snprintf(directory_path, sizeof(directory_path), "%s/%s", base,
                 relative);
   DIR *directory;
   {
@@ -484,7 +510,7 @@ void list_directory(const char *relative, unsigned depth, unsigned &partials) {
                                      *relative ? "/" : "", entry->d_name);
     if (length < 0 || std::size_t(length) >= sizeof(name))
       continue;
-    std::snprintf(path, sizeof(path), "%s/%s", kDirectory, name);
+    std::snprintf(path, sizeof(path), "%s/%s", base, name);
     struct stat info{};
     int stat_result;
     {
@@ -494,9 +520,9 @@ void list_directory(const char *relative, unsigned depth, unsigned &partials) {
     if (stat_result != 0)
       continue;
     if (S_ISDIR(info.st_mode))
-      list_directory(name, depth + 1, partials);
+      list_directory(name, depth + 1, partials, base, export_prefix);
     else if (safe_name(name))
-      Serial.printf("PARQUET FILE name=%s bytes=%lu\n", name,
+      Serial.printf("PARQUET FILE name=%s%s bytes=%lu\n", export_prefix, name,
                     static_cast<unsigned long>(info.st_size));
     else if (std::strstr(name, ".partial"))
       ++partials;
@@ -510,6 +536,14 @@ void list_directory(const char *relative, unsigned depth, unsigned &partials) {
 void list_files() {
   unsigned partials = 0;
   list_directory("", 0, partials);
+  struct stat legacy{};
+  bool has_legacy;
+  {
+    BusLock lock;
+    has_legacy = ::stat("/sd/parquet", &legacy) == 0 && S_ISDIR(legacy.st_mode);
+  }
+  if (has_legacy)
+    list_directory("", 0, partials, "/sd/parquet", "legacy-parquet/");
   Serial.printf("PARQUET PARTIAL retained=%u recovery=not-implemented\n",
                 partials);
   Serial.println("PARQUET LIST END");
@@ -521,7 +555,10 @@ void send_file(const char *name) {
     return;
   }
   char path[416];
-  std::snprintf(path, sizeof(path), "%s/%.384s", kDirectory, name);
+  if (std::strncmp(name, "legacy-parquet/", 15) == 0)
+    std::snprintf(path, sizeof(path), "/sd/parquet/%.369s", name + 15);
+  else
+    std::snprintf(path, sizeof(path), "%s/%.384s", kDirectory, name);
   std::uint32_t size = 0, expected_crc = 0;
   if (!finalized_file(path, size, expected_crc)) {
     Serial.println("PARQUET ERROR operation=get reason=invalid-file");
@@ -635,13 +672,38 @@ void storage_worker(void *) {
     if (std::strcmp(command.text, "parquet status") == 0) {
       Serial.printf(
           "PARQUET STATUS interval_s=%lu buffered=%u finalized=%lu "
-          "dropped=%lu errors=%lu queue_peak=%lu failed=%s station=%s\n",
+          "dropped=%lu errors=%lu queue_peak=%lu failed=%s station=%s "
+          "codec=%s\n",
           static_cast<unsigned long>(rotation_seconds.load()), unsigned(count),
           static_cast<unsigned long>(finalized.load()),
           static_cast<unsigned long>(dropped.load()),
           static_cast<unsigned long>(errors.load()),
           static_cast<unsigned long>(queue_peak.load()),
-          failed ? "true" : "false", station_text);
+          failed ? "true" : "false", station_text, codec_name(selected_codec));
+    } else if (std::strcmp(command.text, "parquet codec-test") == 0) {
+      if (!count || !storage_ready || failed) {
+        Serial.println("PARQUET ERROR operation=codec-test "
+                       "reason=empty-or-storage-failed");
+      } else if (write_batch(count, true, Codec::Uncompressed) &&
+                 write_batch(count, true, Codec::Lz4Raw)) {
+        // Keep the original batch for normal telemetry rotation. Benchmark
+        // copies live outside station trees and are explicitly labeled.
+        Serial.printf("PARQUET BENCH END rows=%u retained_for_telemetry=true\n",
+                      unsigned(count));
+      }
+    } else if (std::strcmp(command.text, "parquet codec none") == 0 ||
+               std::strcmp(command.text, "parquet codec lz4") == 0) {
+      if (count && !write_batch(count)) {
+        failed = true;
+        continue;
+      }
+      count = 0;
+      buffered = 0;
+      failed = false;
+      selected_codec =
+          command.text[14] == 'l' ? Codec::Lz4Raw : Codec::Uncompressed;
+      Serial.printf("PARQUET CONFIG codec=%s persistent=false\n",
+                    codec_name(selected_codec));
     } else if (std::strcmp(command.text, "parquet flush") == 0) {
       if (count && storage_ready) {
         if (write_batch(count)) {

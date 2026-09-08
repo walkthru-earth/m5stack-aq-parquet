@@ -56,6 +56,8 @@ The application continuously drains active UART frames and snapshots the latest 
 
 The LCD/`MEAS` report refreshes independently of the Parquet row and can observe a different, newer sensor frame. Do not compare adjacent display lines as if they were the exact stored values. The capture-to-file check matched explicit row sequence/monotonic timestamps; the two host readers compared the same stored values/nulls. A valid UART frame and a software warm-up gate do not validate environmental accuracy.
 
+The later 90-row uncompressed file and three paired 60-row LZ4 comparisons also preserved PMS values/status through real SD readback, with zero recorded parser/drop/deadline errors in the checked rows. Compression reduced file bytes without changing sensor values; it does not improve sensor accuracy or resolve SHT20 isolation. [Dated codec evidence](bench-verified.md#board-1-lz4-compression)
+
 Parser keywords: bounded streaming, resynchronization, length/checksum/status validation, partial/concatenated-frame tests, stale/error counters, explicit byte decoding. Keep consumption independent of uploads/display. Timeouts mean invalid samples, not zero pollution. Use timestamp-based windows; variable/repeated frames distort frame-count averages. Preserve calibration-field identity; atmospheric fields suit ambient monitoring.
 
 Driver lookup: ESP-IDF `driver/uart.h`, UART event queue/ring buffer; Arduino `HardwareSerial`. [M5 classic PM25 example](https://github.com/m5stack/M5Stack/tree/master/examples/KIT/PM25): protocol cross-check only. A separate PMS library is optional.

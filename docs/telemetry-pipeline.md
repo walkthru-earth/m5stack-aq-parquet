@@ -18,11 +18,13 @@ The active Arduino/C++ trial now **generates Parquet on the CoreS3 and stores it
 
 At this cadence, complete 10- and 15-minute windows contain 60 and 90 rows respectively when no samples are missed. The implementation uses a PSRAM row batch, an eight-row producer queue and a small C++ Parquet writer with no Arrow runtime. Sampling continues into that queue while the storage worker finalizes the batch. Boot, explicit flush, interval changes and clock changes can produce shorter files.
 
-File rotation and reset durability are separate choices. The implemented baseline loses its unfinished RAM batch after reset. It lists and retains `.partial` files on startup without attempting repair. A small SD recovery spool remains a later option if the required loss window is shorter than one rotation. Finalized-file survival still requires power-cut tests before a production durability claim. A real 60-row automatic batch and shorter current-schema Hive files have been read back from SD and opened with both PyArrow and DuckDB. UTC partition agreement, a quarter-hour split and station/file retention across a normal restart were checked separately; a complete 90-row/15-minute run is not yet measured. See [bench-verified](bench-verified.md) for exact firmware, schema and run details.
+File rotation and reset durability are separate choices. The implemented baseline loses its unfinished RAM batch after reset. It lists and retains `.partial` files on startup without attempting repair. A small SD recovery spool remains a later option if the required loss window is shorter than one rotation. Finalized-file survival still requires power-cut tests before a production durability claim. A real 60-row automatic batch and shorter current-schema Hive files have been read back from SD and opened with both PyArrow and DuckDB. UTC partition agreement, a quarter-hour split and station/file retention across a normal restart were checked separately; a later complete 90-row uncompressed Hive file also passed both readers and UTC-window checks. See [bench-verified](bench-verified.md) for exact firmware, schema and run details.
 
 The motivating [ESP32-S3 Rust trial](https://github.com/walkthru-earth/esp32s3-parquet-test/tree/1f3a6c706f85d54a0abe3105b2eed4c6378d814d) uses the Apache Rust Parquet crate with default features/Arrow disabled and `snap` enabled; its lockfile resolves **56.2.0**. The audited source generates 178 synthetic rows and ten columns, builds a complete in-memory file including its footer, and uploads the bytes. It does not implement SD persistence, continuous real-sensor acquisition or power-loss recovery, and the reviewed checkout contains no independently verifiable device-memory captures or generated-file artifacts. Its documented Zstd comparison is a macOS experiment. This is credible implementation evidence for investigating device-side Parquet, not a CoreS3 benchmark. [Dependencies](https://github.com/walkthru-earth/esp32s3-parquet-test/blob/1f3a6c706f85d54a0abe3105b2eed4c6378d814d/Cargo.toml), [writer](https://github.com/walkthru-earth/esp32s3-parquet-test/blob/1f3a6c706f85d54a0abe3105b2eed4c6378d814d/src/main.rs#L266), [host comparison](https://github.com/walkthru-earth/esp32s3-parquet-test/blob/1f3a6c706f85d54a0abe3105b2eed4c6378d814d/index.md#L591).
 
 Object-storage synchronization follows local file validation. Apache Iceberg is explicitly deferred; plain Parquet files can be uploaded and queried without a table catalog.
+
+The tested conclusion is now affirmative: this CoreS3 can create interoperable Parquet directly from real ten-second rows on SD, with a full 90-row uncompressed window verified. In three identical-60-row comparisons, LZ4_RAW reduced whole-file bytes by 50.7% and median finalization time by 21.4% versus the same writer uncompressed. That is evidence for this design/workload, not a benchmark against CBOR/JSON, an energy result, a claim about allocated FAT space, or proof of production durability. [Measurements and limits](compression-benchmark.md#hardware-result-lz4-passed)
 
 The active Arduino trial stays active. [ESP-IDF 6.1](https://github.com/espressif/esp-idf/releases/tag/v6.1) is newer than the ESP-IDF 5.5.5 base inside Arduino-ESP32 3.3.11, but that alone does not justify a second trial. Start an IDF trial only after this implementation produces a measured driver, latency, memory or component limitation and record that finding in the trial README.
 
@@ -119,6 +121,32 @@ The ingestion service can accept the device's finalized Parquet directly. Uninte
 
 For later deployment, OpenTelemetry belongs at the gateway and ingestion services. The current device emits acquisition/storage counters, heap/queue health and a startup reset report; RSSI, upload success and configuration/calibration versioning are not implemented telemetry yet. Add them with networking, then translate device health into cloud metrics, logs and traces.
 
+## Offline capacity and reconnection
+
+Internet is not required for acquisition or SD finalization. With continuous power and working storage, the current firmware keeps collecting offline; it does not presently connect to a network at all. The host-supplied UTC anchor continues from the monotonic clock during an uninterrupted boot, with unmeasured drift. After reboot, UTC is null and files use the unsynced tree until a new time anchor arrives. The station UUID remains persistent. Power loss can discard the unfinished RAM batch; this is independent of available card space.
+
+**Capacity estimate, not lifetime qualification.** The tested nominal 32 GB card reports a 31,441,764,352-byte filesystem. At one row every ten seconds, there are 8,640 rows/day. Assuming future file sizes resemble the measured files and reserving 20% of the filesystem:
+
+| Measured file basis | Rotation assumed | File bytes/day, excluding FAT allocation overhead | Decimal GB/year | Capacity-only years with 20% reserve |
+| --- | --- | ---: | ---: | ---: |
+| 60 rows, LZ4_RAW, 14,080 bytes | 10 minutes / 144 files/day | 2,027,520 | 0.74 | ~34 |
+| Same 60 rows, uncompressed, 28,537 bytes | 10 minutes / 144 files/day | 4,109,328 | 1.50 | ~17 |
+| 90 rows, uncompressed, 39,869 bytes | 15 minutes / 96 files/day | 3,827,424 | 1.40 | ~18 |
+
+These are arithmetic projections, **not claims that the board/card will run for decades**. The current normal interval is 15 minutes; its full 90-row compressed size is not yet measured. Compression varies with values/validity. Directory entries, allocation units, other files, benchmark copies, partial files and short forced batches consume additional space. The actual FAT cluster size is not recorded. For illustration only, if each 10-minute file occupied a 32 KiB cluster, both 14,080 and 28,537-byte files would allocate 32,768 bytes: ~1.72 GB/year and ~15 capacity-years with the same reserve. Thus a 50.7% byte reduction does not automatically halve allocated SD space; it does reduce the bytes a future uploader would send. Measure actual allocated growth before making a retention guarantee.
+
+Card endurance, bit retention, environmental conditions, continuous power, clock accuracy and long-run firmware reliability were not qualified. This is not a battery-runtime estimate. No automatic deletion/retention policy exists: on storage failure the batch is retained in RAM and later drops/errors are counted. A free-space reserve/alarm and tested recovery policy must be implemented before unattended deployment.
+
+**Can it sync afterward? Architecturally yes; currently no uploader exists.** The immutable files and station/date keys can be copied to object storage without re-encoding, but the device has not performed that upload. Remaining work:
+
+1. provision an endpoint, TLS trust and narrowly scoped credentials, without blocking acquisition;
+2. enumerate finalized normal files (exclude diagnostic copies/partials), stream bounded SD reads and retry the same object identity after disconnects;
+3. verify remote size/content digest and persist acknowledgement locally; never equate a send attempt with durable acceptance;
+4. retain local files until that acknowledgement, with an explicit free-space/deletion policy and replay-safe recovery tests;
+5. test disconnects, uncertain upload completion, expired credentials, clock changes and power cuts, plus the shared SD/display/radio workload.
+
+Unsynced files must remain explicitly unsynchronized unless a defensible later clock reconstruction exists. Iceberg/catalog management and cloud compaction can follow basic object upload; neither is needed to establish local Parquet feasibility. Network upload, long offline soak and card lifetime therefore remain open validation questions, not completed features.
+
 ## C and C++ library assessment
 
 These are dated observations, not floating dependencies.
@@ -149,13 +177,13 @@ The current implementation in the active C/C++ trial uses:
 - one immutable file and one row group per rotation;
 - flat INT32/INT64/FLOAT columns; the logger provides definition levels for every column, always populating identity/status fields and leaving unavailable measurements/time null;
 - PLAIN encoding and Data Page V1;
-- uncompressed pages first;
-- no page codec or Parquet page CRC32 yet; serial readback has a separate whole-file CRC32;
+- UNCOMPRESSED by default after reboot, or session-selectable LZ4_RAW using pinned LZ4 1.10.0;
+- bounded page-codec buffers and correct compressed/original byte counts; no Parquet page CRC32 yet, while serial readback has a separate whole-file CRC32;
 - a fixed 90-row logger batch and bounded streaming buffers;
 - a minimal writer-only Thrift Compact implementation in `parquet_writer.cpp`, without Arrow or Carquet dependencies;
 - `.partial` -> sync -> close -> footer validation -> final rename.
 
-Host conformance checks use PyArrow and DuckDB, including nulls and exact integer values. Empty, one-row, boundary-value and wide/maximum-row fixtures pass the host sanitizer test; unsynced and dated files also pass real SD readback. Add multiple-page cases only if that feature is introduced. The automatic 60-row run and current Hive-schema checks are recorded separately in [bench-verified](bench-verified.md); longer runs and failure cases remain open. Benchmark Snappy, `LZ4_RAW` and low-level Zstd against identical rows next, measuring complete-file bytes, CPU time and peak working memory before selecting a codec. Separately run repeated power cuts during data, page header, footer, sync and rename before claiming recovery guarantees. The cited Zstd wrapper's memory figures are specific to its dictionary workload, not a CoreS3 budget.
+Host conformance checks use PyArrow and DuckDB, including nulls and exact integer values. Empty, one-row, boundary-value and wide/maximum-row fixtures pass the host sanitizer test; unsynced and dated files also pass real SD readback. Add multiple-page cases only if that feature is introduced. The automatic 60-row run and current Hive-schema checks are recorded separately in [bench-verified](bench-verified.md); longer runs and failure cases remain open. The [compression experiment](compression-benchmark.md) screens Snappy/LZ4/Zstd on the host and adds an identical-row LZ4_RAW comparison on the board. Measure complete-file bytes, CPU time and memory bounds; on-device Snappy/Zstd and longer codec runs remain open. Separately run repeated power cuts during data, page header, footer, sync and rename before claiming recovery guarantees. The cited Zstd wrapper's memory figures are specific to its dictionary workload, not a CoreS3 budget.
 
 Do not use Parquet's deprecated `LZ4` enum, LZ4 Frame payloads, dictionaries, nested schemas, append-to-finalized files or one file per sample in the first experiment.
 
@@ -167,8 +195,8 @@ Do not use Parquet's deprecated `LZ4` enum, LZ4 Frame payloads, dictionaries, ne
 - **Measure complete files.** The first seven-row file had a 5,490-byte footer in 9,494 total bytes; the 60-row file was 28,059 bytes. Metadata overhead matters for small batches. Compare codec candidates on identical full files and distinguish finalization time from encoding-only time.
 - **Prove the bytes at each layer.** Writer fixtures, device footer/CRC readback, serial length/offset/CRC checks and independent reader comparison test different failure surfaces. A transfer CRC is neither a Parquet page checksum nor a cryptographic upload identity. Host query partition columns must be checked separately from stored schema columns.
 - **Reset, missing data and clock changes need explicit semantics.** Correct serial control-line handling stopped accidental resets; it did not make RAM durable. Null unsupported readings, unsynced paths and immutable clock epochs preserve uncertainty rather than hiding it.
-- **More cores do not remove shared-bus ownership.** A separate storage worker absorbed the tested finalization workload, with no measured reason yet to pin cores. Keep DMA completion and the common SPI lock, and remeasure before adding compression or radios.
-- **Keep evidence scoped.** The complete 60-row run used the earlier 72-column image. Current 73-column Hive files, quarter-hour splitting and normal-restart retention have their own short checks. Full 90-row hardware endurance, clock-correction stress and power-cut recovery remain open. [Dated artifacts and results](bench-verified.md#board-1-on-device-parquet-and-hive-partitions)
+- **More cores do not remove shared-bus ownership.** A separate storage worker absorbed the tested finalization workload, with no measured reason yet to pin cores. Keep DMA completion and the common SPI lock; profile codecs and future radios separately.
+- **Keep evidence scoped.** The complete 60-row run used the earlier 72-column image. Current 73-column Hive files, quarter-hour splitting and normal-restart retention have their own short checks. A later full 90-row uncompressed Hive file now has separate readback evidence; compressed endurance, clock-correction stress and power-cut recovery remain open. [Dated artifacts and results](bench-verified.md#board-1-on-device-parquet-and-hive-partitions)
 
 ### Remaining operational checklist
 
@@ -188,10 +216,10 @@ Do not use Parquet's deprecated `LZ4` enum, LZ4 Frame payloads, dictionaries, ne
 ## Implementation order
 
 1. **Implemented:** live 10-second measurement collection, bounded C++ Parquet writer, SD finalization and host conformance/readback tooling in the active Arduino trial.
-2. **Hardware readback verified:** an automatic 60-row batch and shorter current-schema Hive files open in both readers; exact scope and measured timings are in [bench-verified](bench-verified.md).
-3. **Implemented, partly bench-verified:** persistent station UUID, UTC Hive layout, clock epochs and configurable 600/900-second windows. Station persistence, normal-reset file retention, UTC partition agreement and a quarter-hour boundary split passed. Still test a full 90-row automatic window, midnight and arbitrary clock corrections.
+2. **Hardware readback verified:** automatic 60/90-row uncompressed files, three identical-row LZ4 comparison pairs and a normal compressed Hive smoke file open in both readers; exact scope and measured timings are in [bench-verified](bench-verified.md).
+3. **Implemented, partly bench-verified:** persistent station UUID, UTC Hive layout, clock epochs and configurable 600/900-second windows. Station persistence, normal-reset file retention, UTC partition agreement and a quarter-hour boundary split passed. A full 90-row uncompressed window also passed readback; still test midnight and arbitrary clock corrections.
 4. Measure actual memory, bytes/row, encoding time, SD latency and sampling jitter across longer runs and failure cases.
-5. Benchmark standard Parquet compression on the board using the same rows; choose from measured results.
+5. Compare configured LZ4_RAW and UNCOMPRESSED against identical buffered rows, retaining diagnostic copies outside station trees. Continue with on-device Snappy/Zstd and longer-run memory/latency qualification; see [compression](compression-benchmark.md).
 6. Implement the chosen reset-loss policy, adding a recovery spool if needed, and verify controlled reset/power-cut behavior.
 7. Add immutable HTTPS upload and acknowledgement retention. Cloud compaction and Apache Iceberg remain later milestones.
 

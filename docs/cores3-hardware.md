@@ -74,6 +74,8 @@ Scalar telemetry additions, source-checked **2026-09-08**:
 
 Bench follow-up, **2026-09-08**: Parquet rows on Board 1 contained fresh accelerometer/gyro/auxiliary magnetometer data (`imu_fresh_mask=7`) and valid LTR raw light/proximity readings. This establishes acquisition, not lux/distance conversion, compass calibration or physical accuracy. RTC date/time reads still failed and remained null. Near-zero reported battery voltage does not establish battery presence; the earlier reported `0 mA` was an unsupported API result, not a current measurement. [Measured record](bench-verified.md#board-1-on-device-parquet-and-hive-partitions)
 
+The later LZ4 comparison used the same board, bus ownership and pins; it did not require a second MCU/framework or explicitly pinned cores. Sensor snapshots survived compression/readback unchanged, with post-write acquisition continuity checked. This is workload evidence, not calibration, battery endurance or radio-concurrency qualification. [Compression bench](bench-verified.md#board-1-lz4-compression)
+
 On ESP32-S3, do not probe reserved 7-bit addresses `0x00` through `0x07`. M5Unified 0.2.21 deliberately starts its full-bus scan at `0x08` because probing the low range can stop the controller. The first diagnostic reproduced that hang on this board; scan only `0x08` through `0x77`. [M5Unified implementation](https://github.com/m5stack/M5Unified/blob/0.2.21/src/utility/I2C_Class.cpp#L105-L112), [measured](bench-verified.md)
 
 AW9523B map; `P0_n/P1_n` are expander bits, not ESP GPIOs. Registers: input **0x00/01**, output **0x02/03**, direction **0x04/05** (`1=input`). [Schematic p5][sch], [Initialization][gfx]; remaining register semantics: [AW9523 datasheet][aw].

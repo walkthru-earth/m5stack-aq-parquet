@@ -88,13 +88,15 @@ During an active Parquet run, prefer `pixi run parquet-device capture --port <po
 - One storage worker owns filesystem access after startup; display and SD share an application mutex, with display DMA completed before unlock. Do not infer safe concurrent SPI access or measured speedup from the presence of two cores.
 - Keep station identity in NVS and the UTC Hive path contract. Unsynchronized time stays null and uses the `unsynced` tree; do not fabricate dates or silently rewrite previous rows after a clock update.
 - Finalized Parquet files are immutable. Retain `.partial` files; no automatic formatting, recovery, retention deletion or upload is implemented. RAM-only batching can lose the unfinished batch on reset, and a normal-reset readback does not prove power-cut durability.
-- Keep the earlier 72-column/60-row measurement distinct from current 73-column Hive checks. A 90-row host fixture is not a full 15-minute hardware test. Compression and radio/upload benchmarks remain future work.
+- Keep each measurement tied to its image/schema. The earlier 72-column/60-row and later 73-column/90-row uncompressed runs are separate evidence. A host fixture is not a hardware endurance test; Snappy/Zstd and radio/upload still need board measurements. LZ4 details and measured scope live in `docs/compression-benchmark.md`.
 
 ## Code quality gates
 
 `pixi run fmt`, `pixi run fmt-check`, `pixi run lint` (cppcheck over `firmware/`), `pixi run hooks` to install pre-commit.
 
-For writer/schema or readback changes, also run `pixi run parquet-test --sanitize` and proportionate SD readback tests. The format tasks select Git-tracked C/C++ files; run clang-format explicitly on newly created, untracked sources too. Keep generated binaries, captures and readback files in the trial's git-ignored `build/` directory, and record their identities/hashes in `docs/bench-verified.md` when using them as evidence.
+For writer/schema or readback changes, also run `pixi run parquet-test --sanitize` and proportionate SD readback tests. The format tasks select Git-tracked C/C++ files; run clang-format explicitly on newly created, untracked sources too. Preserve vendored source bytes/licenses and their `.clang-format-ignore` exclusion. Project lint excludes vendor diagnostics and checks one configuration; the linked codec is tested with sanitizers.
+
+Keep **captures, exports, benchmark reports and retained firmware binaries in the trial's git-ignored `artifacts/` directory, outside `build/`**. Arduino cleaned `build/` during a changed-configuration rebuild and removed the first local exports/logs; SD files were retained and all finalized Parquet files were restored into `artifacts/`. Never treat a build cache as evidence storage. Record artifact identities/hashes in `docs/bench-verified.md`.
 
 ## Hard rules
 

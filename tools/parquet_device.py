@@ -283,8 +283,8 @@ def capture(port, args) -> int:
 
 def command(port, args) -> int:
     text = " ".join(args.text.split())
-    if text not in {"parquet status", "parquet list", "parquet flush", "parquet interval 600", "parquet interval 900"}:
-        raise ValueError("supported commands: parquet status/list/flush/interval 600/interval 900; use fetch for get")
+    if text not in {"parquet status", "parquet list", "parquet flush", "parquet interval 600", "parquet interval 900", "parquet codec none", "parquet codec lz4", "parquet codec-test"}:
+        raise ValueError("supported commands: parquet status/list/flush/interval 600/interval 900/codec none/codec lz4/codec-test; use fetch for get")
     send_command(port, text)
     for line in lines_until(port, time.monotonic() + args.timeout):
         print(line, flush=True)
@@ -292,6 +292,9 @@ def command(port, args) -> int:
             raise RuntimeError(line)
         if text == "parquet list":
             if line == "PARQUET LIST END":
+                return 0
+        elif text == "parquet codec-test":
+            if line.startswith("PARQUET BENCH END"):
                 return 0
         elif text == "parquet flush":
             if line.startswith(("PARQUET READY", "PARQUET FLUSH")):

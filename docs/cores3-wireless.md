@@ -7,6 +7,8 @@ The current trial logs Parquet to SD without Wi-Fi, BLE, ESP-NOW, NTP or object-
 
 ## Radio and channel model
 
+The LZ4 SD benchmark establishes local feasibility and smaller payloads, not network throughput or successful synchronization. Offline capacity is a storage projection; continuous power, clock handling and acknowledged reconnect/upload still need their own design/tests. See [offline capacity and reconnection](telemetry-pipeline.md#offline-capacity-and-reconnection). Plain Parquet object upload can precede Iceberg.
+
 | Requirement | CoreS3 behavior / decision |
 |---|---|
 | Wi-Fi | 2.4 GHz 802.11 b/g/n (Wi-Fi 4), HT20/HT40; no integrated 5/6 GHz or Wi-Fi 6. [SoC][soc] |

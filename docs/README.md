@@ -4,7 +4,7 @@ Target: **M5Stack CoreS3 / ESP32-S3**, C and/or C++. Accessories are optional, s
 
 Entry point: root [`AGENTS.md`](../AGENTS.md). It routes here and holds the host-environment and hard rules.
 
-Current result: the [active Arduino trial](../firmware/arduino-m5unified/README.md) writes real 10-second scalar snapshots directly to SD as uncompressed Parquet, with configurable 10/15-minute batching and UTC Hive partitions. The [bench record](bench-verified.md#board-1-on-device-parquet-and-hive-partitions) separates the full 60-row test from shorter current-schema Hive/restart checks. RAM-batch recovery, compression, radio/upload and Iceberg remain open; this is not a production durability claim.
+Current result: the [active Arduino trial](../firmware/arduino-m5unified/README.md) writes real 10-second scalar snapshots directly to SD, with configurable 10/15-minute batching, UTC Hive partitions and optional LZ4_RAW compression. The [bench record](bench-verified.md#board-1-on-device-parquet-and-hive-partitions) separates the 60/90-row uncompressed runs and Hive/restart checks from codec testing. RAM-batch recovery, radio/upload and Iceberg remain open; this is not a production durability claim. Evidence belongs in git-ignored `artifacts/`, outside the disposable `build/` directory.
 
 | When working on… | Read |
 | --- | --- |
@@ -14,6 +14,8 @@ Current result: the [active Arduino trial](../firmware/arduino-m5unified/README.
 | Built-in microSD slot, shared SPI, logging, removal/recovery | [Storage](cores3-storage.md) |
 | Sensor validity, station identity, clock epochs, Parquet, Hive and future ingestion | [Telemetry pipeline](telemetry-pipeline.md) |
 | Build/flash, runtime interval/time commands, USB fetch and query examples | [Active trial usage](../firmware/arduino-m5unified/README.md) |
+| Codec comparison, memory budget, identical-row SD tests and benchmark artifacts | [Compression experiment](compression-benchmark.md) |
+| Offline duration, 32 GB capacity assumptions and future object-storage synchronization | [Offline capacity and reconnect plan](telemetry-pipeline.md#offline-capacity-and-reconnection) |
 | Any optional Unit, Module, Base, or third-party peripheral | [Add-on integration](addons.md), then its individual reference |
 | Optional M134/PMSA003 air-quality accessory | [Air-quality add-on](addon-air-quality.md) |
 | What was actually measured on our board, versus what is only source-checked | [Bench-verified record](bench-verified.md) |

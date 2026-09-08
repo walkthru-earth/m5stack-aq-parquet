@@ -44,7 +44,8 @@ arduino-flash = "firmware/arduino-m5unified/flash.sh"
 # --- host code quality ---
 fmt = "clang-format -i $(git ls-files '*.c' '*.h' '*.cpp' '*.hpp' '*.ino' 2>/dev/null)"
 fmt-check = "clang-format --dry-run --Werror $(git ls-files '*.c' '*.h' '*.cpp' '*.hpp' '*.ino' 2>/dev/null)"
-lint = "cppcheck --language=c++ --enable=warning,style,performance,portability --inline-suppr --error-exitcode=1 --std=c++23 firmware/arduino-m5unified/bringup/bringup.ino firmware/arduino-m5unified/bringup/telemetry_logger.cpp firmware/arduino-m5unified/bringup/parquet_writer.cpp"
+lint = "cppcheck --language=c++ --enable=warning,style,performance,portability --inline-suppr --error-exitcode=1 --std=c++23 --max-configs=1 --suppress=*:*/vendor/lz4/* firmware/arduino-m5unified/bringup/bringup.ino firmware/arduino-m5unified/bringup/telemetry_logger.cpp firmware/arduino-m5unified/bringup/parquet_writer.cpp firmware/arduino-m5unified/bringup/lz4_codec.cpp"
+compression-bench = "python tools/benchmark_compression.py"
 hooks = "pre-commit install"
 
 [dependencies]

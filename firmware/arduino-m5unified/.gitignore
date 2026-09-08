@@ -1,4 +1,5 @@
 build/
+artifacts/
 bringup/build/
 bringup/*.bin
 bringup/*.elf

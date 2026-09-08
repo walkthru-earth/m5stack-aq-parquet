@@ -166,33 +166,21 @@ size_t definition_levels(const Column &column, size_t rows,
   return length;
 }
 
-void page(Output &out, const Column &column, size_t rows) {
-  const size_t definitions = column.valid ? definition_levels(column, rows) : 0;
-  const size_t payload = present_count(column, rows) * width(column.type) +
-                         (column.valid ? 4 + definitions : 0);
-  Struct header(out);
-  header.number(1, kI32, 0); // DATA_PAGE
-  header.number(2, kI32, payload);
-  header.number(3, kI32, payload);
-  header.field(5, kStruct);
-  Struct data(out);
-  data.number(1, kI32, rows);
-  data.number(2, kI32, 0); // PLAIN
-  data.number(3, kI32, 3); // RLE definition levels
-  data.number(4, kI32, 3); // RLE repetition levels (no bytes: max level 0)
-  data.end();
-  header.end();
+size_t payload_size(const Column &column, size_t rows) {
+  return present_count(column, rows) * width(column.type) +
+         (column.valid ? 4 + definition_levels(column, rows) : 0);
+}
 
+void payload_bytes(Output &out, const Column &column, size_t rows) {
   if (column.valid) {
-    out.little_endian(definitions, 4);
+    out.little_endian(definition_levels(column, rows), 4);
     definition_levels(column, rows, &out);
   }
   const auto *values = static_cast<const uint8_t *>(column.values);
   for (size_t row = 0; row < rows && out.ok(); ++row) {
     if (!present(column, row))
       continue;
-    // memcpy avoids alignment and aliasing assumptions for AoS fields. Read
-    // each native-width unsigned representation, then emit little endian.
+    // memcpy avoids alignment/aliasing assumptions; emit explicitly LE.
     if (column.type == PhysicalType::Int64) {
       uint64_t value;
       memcpy(&value, values + row * column.stride, sizeof(value));
@@ -205,9 +193,67 @@ void page(Output &out, const Column &column, size_t rows) {
   }
 }
 
+struct MemorySink {
+  uint8_t *data = nullptr;
+  size_t capacity = 0;
+  size_t used = 0;
+};
+bool memory_sink(void *context, const uint8_t *data, size_t size) {
+  auto &memory = *static_cast<MemorySink *>(context);
+  if (size > memory.capacity - memory.used)
+    return false;
+  memcpy(memory.data + memory.used, data, size);
+  memory.used += size;
+  return true;
+}
+
+bool page(Output &out, const Column &column, size_t rows, Workspace &workspace,
+          const Compression *compression, uint64_t &uncompressed_size) {
+  const size_t definitions = column.valid ? definition_levels(column, rows) : 0;
+  const size_t payload = present_count(column, rows) * width(column.type) +
+                         (column.valid ? 4 + definitions : 0);
+  size_t compressed = payload;
+  if (compression) {
+    // Both Outputs reuse the staging buffer, never while the other has bytes.
+    out.flush();
+    if (!out.ok())
+      return false;
+    MemorySink memory{compression->raw, compression->raw_capacity};
+    Output raw(memory_sink, &memory, workspace);
+    payload_bytes(raw, column, rows);
+    raw.flush();
+    if (!raw.ok() || memory.used != payload)
+      return false;
+    compressed = compression->compress(compression->context, compression->raw,
+                                       payload, compression->encoded,
+                                       compression->encoded_capacity);
+    if (!compressed || compressed > compression->encoded_capacity)
+      return false;
+  }
+  const auto header_start = out.position();
+  Struct header(out);
+  header.number(1, kI32, 0); // DATA_PAGE
+  header.number(2, kI32, payload);
+  header.number(3, kI32, compressed);
+  header.field(5, kStruct);
+  Struct data(out);
+  data.number(1, kI32, rows);
+  data.number(2, kI32, 0); // PLAIN
+  data.number(3, kI32, 3); // RLE definition levels
+  data.number(4, kI32, 3); // RLE repetition levels (no bytes: max level 0)
+  data.end();
+  header.end();
+  uncompressed_size = out.position() - header_start + payload;
+  if (compression)
+    out.bytes(compression->encoded, compressed);
+  else
+    payload_bytes(out, column, rows);
+  return out.ok();
+}
+
 void footer(Output &out, const Column *columns, size_t count, size_t rows,
             const Workspace &workspace, const KeyValue *metadata,
-            size_t metadata_count) {
+            size_t metadata_count, Codec codec) {
   Struct file(out);
   file.number(1, kI32, 1);
   file.list(2, kStruct, count + 1);
@@ -230,7 +276,7 @@ void footer(Output &out, const Column *columns, size_t count, size_t rows,
     uint64_t total = 0;
     for (size_t i = 0; i < count; ++i) {
       const Column &column = columns[i];
-      total += workspace.sizes[i];
+      total += workspace.uncompressed_sizes[i];
       Struct chunk(out);
       chunk.number(2, kI64, 0); // metadata lives only in this footer
       chunk.field(3, kStruct);
@@ -241,9 +287,9 @@ void footer(Output &out, const Column *columns, size_t count, size_t rows,
       out.integer(3); // RLE
       meta.list(3, kBinary, 1);
       out.string(column.name);
-      meta.number(4, kI32, 0); // UNCOMPRESSED
+      meta.number(4, kI32, static_cast<uint8_t>(codec));
       meta.number(5, kI64, rows);
-      meta.number(6, kI64, workspace.sizes[i]);
+      meta.number(6, kI64, workspace.uncompressed_sizes[i]);
       meta.number(7, kI64, workspace.sizes[i]);
       meta.number(9, kI64, workspace.offsets[i]);
       meta.field(12, kStruct); // Statistics: null count, no min/max claims
@@ -285,7 +331,12 @@ bool bounded_string(const char *value, size_t limit, bool allow_empty = false) {
 Result write_parquet(Sink sink, void *context, const Column *columns,
                      size_t column_count, size_t row_count,
                      Workspace &workspace, const KeyValue *metadata,
-                     size_t metadata_count) {
+                     size_t metadata_count, const Compression *compression) {
+  if (compression &&
+      (compression->codec != Codec::Lz4Raw || !compression->raw ||
+       !compression->encoded || !compression->compress ||
+       compression->encoded_capacity > INT32_MAX))
+    return {false, 0, "invalid compression configuration"};
   if (!sink || !columns || !column_count || column_count > kMaxColumns ||
       row_count > kMaxRows || metadata_count > 64 ||
       (metadata_count && !metadata)) {
@@ -310,6 +361,9 @@ Result write_parquet(Sink sink, void *context, const Column *columns,
                            column.valid_stride > SIZE_MAX / row_count)))) {
       return {false, 0, "invalid column buffer or stride"};
     }
+    if (compression && row_count &&
+        payload_size(column, row_count) > compression->raw_capacity)
+      return {false, 0, "compression page capacity exceeded"};
   }
   for (size_t i = 0; i < metadata_count; ++i) {
     if (!bounded_string(metadata[i].key, 255) ||
@@ -322,7 +376,10 @@ Result write_parquet(Sink sink, void *context, const Column *columns,
   if (row_count) {
     for (size_t i = 0; i < column_count && out.ok(); ++i) {
       workspace.offsets[i] = out.position();
-      page(out, columns[i], row_count);
+      if (!page(out, columns[i], row_count, workspace, compression,
+                workspace.uncompressed_sizes[i]))
+        return {false, out.accepted(),
+                "page encoding/compression or sink failed"};
       workspace.sizes[i] = out.position() - workspace.offsets[i];
     }
   }
@@ -330,7 +387,8 @@ Result write_parquet(Sink sink, void *context, const Column *columns,
     return {false, out.accepted(), "sink write failed"};
   const uint64_t footer_start = out.position();
   footer(out, columns, column_count, row_count, workspace, metadata,
-         metadata_count);
+         metadata_count,
+         compression ? compression->codec : Codec::Uncompressed);
   out.little_endian(out.position() - footer_start, 4);
   out.bytes("PAR1", 4);
   out.flush();

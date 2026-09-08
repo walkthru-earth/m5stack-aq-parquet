@@ -78,7 +78,7 @@ def check_row(actual: tuple, index: int, rows: int, columns: int, reader: str) -
         check_float(actual[col], expected[2], f"{reader}: row {index}, float column {col}")
 
 
-def check_file(path: Path, rows: int, columns: int) -> None:
+def check_file(path: Path, rows: int, columns: int, codec: str = "UNCOMPRESSED") -> None:
     names = BASE_NAMES + [f"extra_{i:02}" for i in range(8, columns)]
     types = [pa.int64(), pa.int32(), pa.float32(), pa.int32(), pa.float32(),
              pa.int64(), pa.int64(), pa.float32()] + [pa.float32()] * (columns - 8)
@@ -99,10 +99,12 @@ def check_file(path: Path, rows: int, columns: int) -> None:
     if rows:
         group = metadata.row_group(0)
         require(group.num_rows == rows, "row-group rows")
+        require(group.total_byte_size == sum(group.column(i).total_uncompressed_size for i in range(columns)),
+                "row-group uncompressed size accounting")
         for index, name in enumerate(names):
             column = group.column(index)
             require(column.path_in_schema == name, "column metadata order")
-            require(column.compression == "UNCOMPRESSED", f"codec: {name}")
+            require(column.compression == codec, f"codec: {name}")
             require(set(column.encodings) == {"PLAIN", "RLE"}, f"encodings: {name}")
             require(column.num_values == rows, f"value count: {name}")
             nulls = rows if name == "all_null" else ((rows + 1) // 2 if name.startswith("optional_") else 0)
@@ -130,11 +132,13 @@ def main() -> None:
         directory = Path(temporary)
         executable = directory / "parquet_fixture"
         command = ["clang++", "-std=c++17", "-Wall", "-Wextra", "-Werror"]
+        command += ["-I", str(root / "firmware/arduino-m5unified/vendor/lz4")]
         if args.sanitize:
             command += ["-fsanitize=address,undefined", "-fno-sanitize-recover=all"]
         command += [
             str(root / "tools/parquet_fixture.cpp"),
             str(root / "firmware/arduino-m5unified/bringup/parquet_writer.cpp"),
+            str(root / "firmware/arduino-m5unified/bringup/lz4_codec.cpp"),
             "-o", str(executable),
         ]
         subprocess.run(command, check=True)
@@ -144,11 +148,15 @@ def main() -> None:
             ("wide", 90, 96),
             ("large", 65536, 8),
         ):
-            path = directory / f"{label}.parquet"
-            subprocess.run([str(executable), str(path), str(rows), str(columns)],
-                           check=True, stdout=subprocess.DEVNULL)
-            check_file(path, rows, columns)
-            print(f"PASS {label}: {rows} rows x {columns} columns; PyArrow + DuckDB exact readback", flush=True)
+            for codec in ("UNCOMPRESSED", "LZ4"):
+                path = directory / f"{label}-{codec}.parquet"
+                command = [str(executable), str(path), str(rows), str(columns)]
+                if codec == "LZ4":
+                    command.append("lz4")
+                subprocess.run(command, check=True, stdout=subprocess.DEVNULL)
+                # PyArrow names codec enum 7 (LZ4_RAW) "LZ4" in its Python API.
+                check_file(path, rows, columns, codec)
+                print(f"PASS {label} {codec}: {rows} rows x {columns} columns; PyArrow + DuckDB exact readback", flush=True)
     print("PASS firmware Parquet writer conformance" + (" (ASan + UBSan)" if args.sanitize else ""))
 
 
