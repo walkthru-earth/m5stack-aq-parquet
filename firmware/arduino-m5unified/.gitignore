@@ -1,0 +1,5 @@
+build/
+bringup/build/
+bringup/*.bin
+bringup/*.elf
+bringup/*.map

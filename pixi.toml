@@ -10,19 +10,19 @@ version = "0.1.0"
 # Which serial ports exist. Run before anything that touches the board.
 ports = "python -m serial.tools.list_ports -v"
 # Confirm you are talking to an ESP32-S3 and not another board. Read-only.
-chip = "esptool --chip esp32s3 chip-id"
-flash-id = "esptool --chip esp32s3 flash-id"
-mac = "esptool --chip esp32s3 read-mac"
+chip = "tools/esptool-read.sh chip-id"
+flash-id = "tools/esptool-read.sh flash-id"
+mac = "tools/esptool-read.sh read-mac"
 # Read-only eFuse dump. Confirms flash type, wafer revision and that no
 # secure-boot or flash-encryption fuse has been burned.
-efuse = "espefuse summary"
+efuse = "tools/espefuse-summary.sh"
 # Full 16 MB flash image before the first write. This is the anti-brick step.
 # Do NOT add a high --baud here. Measured on CoreS3 over USB-Serial/JTAG, the
 # esptool default read the whole 16 MB in 97 s, while --baud 921600 aborted
 # partway with "Serial data stream stopped, possible serial noise or corruption".
-backup = { cmd = "mkdir -p backup && esptool --chip esp32s3 read-flash 0 0x1000000 backup/cores3-flash-$(date -u +%Y%m%dT%H%M%SZ).bin" }
+backup = "tools/backup-flash.sh"
 # Restore a backup taken above. Destructive, pass the file explicitly.
-restore = "esptool --chip esp32s3 write-flash 0"
+restore = "tools/restore-flash.sh"
 # Show the partition table of a saved backup image. Read-only, pass the file.
 backup-partitions = "python tools/read_partitions.py"
 # Read the board's serial output for a bounded time, then stop. Never writes
@@ -32,10 +32,17 @@ capture = "python tools/capture_serial.py"
 # pixi run monitor /dev/cu.usbmodem101 115200
 monitor = "python -m serial.tools.miniterm --raw"
 
+# --- active firmware trial: Arduino ESP32 + M5Unified ---
+arduino-setup = "firmware/arduino-m5unified/setup.sh"
+arduino-boards = "firmware/arduino-m5unified/arduino-cli.sh board listall m5stack_cores3"
+arduino-build = "firmware/arduino-m5unified/build.sh"
+# Destructive: pass the explicit checked port, e.g. pixi run arduino-flash /dev/cu.usbmodem101
+arduino-flash = "firmware/arduino-m5unified/flash.sh"
+
 # --- host code quality ---
-fmt = "clang-format -i $(git ls-files '*.c' '*.h' '*.cpp' '*.hpp' 2>/dev/null)"
-fmt-check = "clang-format --dry-run --Werror $(git ls-files '*.c' '*.h' '*.cpp' '*.hpp' 2>/dev/null)"
-lint = "cppcheck --enable=warning,style,performance,portability --inline-suppr --error-exitcode=1 --std=c++23 firmware"
+fmt = "clang-format -i $(git ls-files '*.c' '*.h' '*.cpp' '*.hpp' '*.ino' 2>/dev/null)"
+fmt-check = "clang-format --dry-run --Werror $(git ls-files '*.c' '*.h' '*.cpp' '*.hpp' '*.ino' 2>/dev/null)"
+lint = "cppcheck --language=c++ --enable=warning,style,performance,portability --inline-suppr --error-exitcode=1 --std=c++23 firmware/arduino-m5unified/bringup/bringup.ino"
 hooks = "pre-commit install"
 
 [dependencies]
