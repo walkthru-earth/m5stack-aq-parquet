@@ -6,6 +6,8 @@ The repo can hold **more than one framework trial** against the same board, shar
 
 - `AGENTS.md` is the entry point for humans and coding agents.
 - `docs/` holds framework-neutral CoreS3 references, including the [telemetry and Parquet pipeline](docs/telemetry-pipeline.md).
+- `product/` holds the [mobile app workflows](product/mobile-app.md), [architecture and privacy](product/mobile-architecture.md), and [Bluetooth SQL idea](product/bluetooth-parquet.md); these are proposals, not implemented features.
+- The [community extension shortlist](product/community-extension-shortlist.md) maps DuckDB candidates to these product ideas, with adoption limits and source references.
 - `firmware/<framework>-<variant>/` holds each self-contained trial.
 
 ## Current status
