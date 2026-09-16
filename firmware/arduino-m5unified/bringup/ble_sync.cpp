@@ -1,0 +1,320 @@
+#include "ble_sync.h"
+#include "debug_log.h"
+#include "telemetry_logger.h"
+
+#include <Arduino.h>
+#include <NimBLEDevice.h>
+#include <esp_random.h>
+#include <esp_timer.h>
+#include <freertos/FreeRTOS.h>
+#include <freertos/task.h>
+
+#include <atomic>
+#include <cstdio>
+#include <cstring>
+
+namespace ble {
+namespace {
+constexpr const char *kServiceUuid = "c0a5e9f0-0001-4b1a-9c3e-2d7f8a6b4e01";
+constexpr const char *kInfoUuid = "c0a5e9f0-0002-4b1a-9c3e-2d7f8a6b4e01";
+constexpr const char *kStatusUuid = "c0a5e9f0-0003-4b1a-9c3e-2d7f8a6b4e01";
+constexpr const char *kLiveUuid = "c0a5e9f0-0004-4b1a-9c3e-2d7f8a6b4e01";
+constexpr const char *kControlUuid = "c0a5e9f0-0005-4b1a-9c3e-2d7f8a6b4e01";
+constexpr const char *kResponseUuid = "c0a5e9f0-0006-4b1a-9c3e-2d7f8a6b4e01";
+constexpr std::int64_t kPairingWindowUs = 60LL * 1000000LL;
+// Host back-pressure budget: with Wi-Fi active the controller can refuse
+// notifications for well over 200 ms at a time (measured 2026-09-17: LIST
+// over BLE aborted silently at the old 50 x 4 ms budget). 400 x 10 ms = 4 s.
+constexpr unsigned kNotifyRetries = 400;
+constexpr TickType_t kNotifyRetryDelay = pdMS_TO_TICKS(10);
+
+char name_text[16]{};
+char info_text[400]{};
+NimBLEServer *server = nullptr;
+NimBLECharacteristic *status_char = nullptr;
+NimBLECharacteristic *live_char = nullptr;
+NimBLECharacteristic *response_char = nullptr;
+
+std::atomic<bool> enabled{false}, advertising{false}, connected{false},
+    authenticated{false}, pairing_active{false};
+std::atomic<std::uint16_t> conn_handle{BLE_HS_CONN_HANDLE_NONE}, mtu{0};
+std::atomic<std::uint32_t> passkey{0}, bonds{0}, generation{0}, ui{0};
+std::atomic<std::int64_t> pairing_deadline{0};
+config::PairMode mode = config::PairMode::Random;
+std::uint32_t fixed_passkey = config::kDefaultPin;
+
+void touch_ui() { ++ui; }
+
+bool notify(NimBLECharacteristic *characteristic, const std::uint8_t *data,
+            std::size_t length) {
+  if (!characteristic || !connected.load())
+    return false;
+  const auto handle = conn_handle.load();
+  for (unsigned attempt = 0; attempt < kNotifyRetries; ++attempt) {
+    if (!connected.load())
+      return false;
+    if (characteristic->notify(data, length, handle))
+      return true;
+    vTaskDelay(kNotifyRetryDelay);
+  }
+  return false;
+}
+
+class ServerCallbacks : public NimBLEServerCallbacks {
+public:
+  void onConnect(NimBLEServer *, NimBLEConnInfo &info) override {
+    conn_handle = info.getConnHandle();
+    mtu = info.getMTU();
+    connected = true;
+    advertising = false;
+    authenticated = info.isAuthenticated();
+    ++generation;
+    touch_ui();
+    aqlog.printf("BLE CONNECT peer=%s mtu=%u\n",
+                 info.getAddress().toString().c_str(), unsigned(mtu.load()));
+  }
+  void onDisconnect(NimBLEServer *, NimBLEConnInfo &, int reason) override {
+    connected = false;
+    authenticated = false;
+    pairing_active = false;
+    conn_handle = BLE_HS_CONN_HANDLE_NONE;
+    mtu = 0;
+    ++generation;
+    // advertiseOnDisconnect(true) restarts advertising inside the host.
+    advertising = true;
+    touch_ui();
+    aqlog.printf("BLE DISCONNECT reason=%d\n", reason);
+  }
+  void onMTUChange(std::uint16_t new_mtu, NimBLEConnInfo &) override {
+    mtu = new_mtu;
+    touch_ui();
+    aqlog.printf("BLE MTU mtu=%u\n", unsigned(new_mtu));
+  }
+  std::uint32_t onPassKeyDisplay() override {
+    // `random`: fresh six digits for each pairing attempt, shown by the display
+    // loop and printed so a bench log can reproduce the pairing. `fixed`: the
+    // owner's PIN (default 123456) for boards without a screen; still shown
+    // when a screen exists. The pairing overlay is drawn in both modes.
+    const std::uint32_t key = mode == config::PairMode::Fixed
+                                  ? fixed_passkey
+                                  : esp_random() % 1000000U;
+    passkey = key;
+    pairing_deadline = esp_timer_get_time() + kPairingWindowUs;
+    pairing_active = true;
+    touch_ui();
+    if (mode == config::PairMode::Fixed)
+      aqlog.println("BLE PAIR passkey=fixed");
+    else
+      aqlog.printf("BLE PAIR passkey=%06lu\n", static_cast<unsigned long>(key));
+    return key;
+  }
+  void onAuthenticationComplete(NimBLEConnInfo &info) override {
+    pairing_active = false;
+    // In `none` mode the link is encrypted but never authenticated; treat an
+    // encrypted Just-Works link as good enough, as the characteristics do.
+    authenticated = info.isEncrypted() &&
+                    (mode == config::PairMode::None || info.isAuthenticated());
+    bonds = static_cast<std::uint32_t>(NimBLEDevice::getNumBonds());
+    touch_ui();
+    if (!info.isEncrypted()) {
+      aqlog.println("BLE AUTH result=not-encrypted action=disconnect");
+      NimBLEDevice::getServer()->disconnect(info);
+      return;
+    }
+    aqlog.printf("BLE BONDED peer=%s bonded=%s authenticated=%s bonds=%lu\n",
+                 info.getAddress().toString().c_str(),
+                 info.isBonded() ? "true" : "false",
+                 info.isAuthenticated() ? "true" : "false",
+                 static_cast<unsigned long>(bonds.load()));
+  }
+};
+
+class ControlCallbacks : public NimBLECharacteristicCallbacks {
+public:
+  void onWrite(NimBLECharacteristic *characteristic,
+               NimBLEConnInfo &info) override {
+    const auto received = esp_timer_get_time();
+    const NimBLEAttValue value = characteristic->getValue();
+    ControlRequest request;
+    request.received_mono_us = received;
+    request.conn_handle = info.getConnHandle();
+    request.link = Link::Ble;
+    request.link_generation = generation.load();
+    request.length = value.length() > kMaxControlBytes
+                         ? kMaxControlBytes
+                         : static_cast<std::uint16_t>(value.length());
+    if (request.length == 0) {
+      send_error(kOpList, kErrMalformed, "empty");
+      return;
+    }
+    std::memcpy(request.bytes, value.data(), request.length);
+    aqlog.printf("BLE CMD op=0x%02x bytes=%u\n", unsigned(request.bytes[0]),
+                 unsigned(request.length));
+    if (!telemetry::enqueue_request(request))
+      send_error(static_cast<Op>(request.bytes[0]), kErrBusy, "queue-full");
+  }
+};
+
+ServerCallbacks server_callbacks;
+ControlCallbacks control_callbacks;
+} // namespace
+
+bool begin(const Identity &identity, config::PairMode pairing_mode,
+           std::uint32_t fixed_pin) {
+  mode = pairing_mode;
+  fixed_passkey = fixed_pin % 1000000U;
+  const std::size_t device_length = std::strlen(identity.device);
+  std::snprintf(name_text, sizeof(name_text), "AQ-%s",
+                device_length >= 4 ? identity.device + device_length - 4
+                                   : identity.device);
+  std::snprintf(info_text, sizeof(info_text),
+                "{\"proto\":%u,\"fw\":\"%s\",\"schema\":\"%s\",\"cols\":%u,"
+                "\"dict\":\"%s\",\"station\":\"%s\",\"dev\":\"%s\","
+                "\"boot\":\"%s\",\"max_read\":%lu}",
+                unsigned(kProtocolVersion), identity.firmware, identity.schema,
+                identity.columns, identity.dictionary_sha256, identity.station,
+                identity.device, identity.boot,
+                static_cast<unsigned long>(kMaxRead));
+
+  if (!NimBLEDevice::init(name_text)) {
+    aqlog.println("BLE ERROR operation=init");
+    return false;
+  }
+  NimBLEDevice::setMTU(kMaxMtu);
+  // bonding, MITM, LE Secure Connections. `none` drops MITM (Just Works) and
+  // therefore also the AUTHEN requirement on every characteristic below.
+  const bool mitm = mode != config::PairMode::None;
+  NimBLEDevice::setSecurityAuth(true, mitm, true);
+  NimBLEDevice::setSecurityIOCap(mitm ? BLE_HS_IO_DISPLAY_ONLY
+                                      : BLE_HS_IO_NO_INPUT_OUTPUT);
+  if (mode == config::PairMode::Fixed)
+    NimBLEDevice::setSecurityPasskey(fixed_passkey);
+  bonds = static_cast<std::uint32_t>(NimBLEDevice::getNumBonds());
+
+  server = NimBLEDevice::createServer();
+  server->setCallbacks(&server_callbacks);
+  server->advertiseOnDisconnect(true);
+  NimBLEService *service = server->createService(kServiceUuid);
+  const std::uint32_t kReadSecure = NIMBLE_PROPERTY::READ |
+                                    NIMBLE_PROPERTY::READ_ENC |
+                                    (mitm ? NIMBLE_PROPERTY::READ_AUTHEN : 0U);
+  const std::uint32_t kWriteSecure =
+      NIMBLE_PROPERTY::WRITE | NIMBLE_PROPERTY::WRITE_ENC |
+      (mitm ? NIMBLE_PROPERTY::WRITE_AUTHEN : 0U);
+  NimBLECharacteristic *info_char =
+      service->createCharacteristic(kInfoUuid, kReadSecure, sizeof(info_text));
+  info_char->setValue(info_text);
+  status_char = service->createCharacteristic(
+      kStatusUuid, kReadSecure | NIMBLE_PROPERTY::NOTIFY, kMaxJson + 16);
+  status_char->setValue("{}");
+  live_char = service->createCharacteristic(
+      kLiveUuid, kReadSecure | NIMBLE_PROPERTY::NOTIFY, kMaxJson + 16);
+  live_char->setValue("{}");
+  NimBLECharacteristic *control_char = service->createCharacteristic(
+      kControlUuid, kWriteSecure, kMaxControlBytes);
+  control_char->setCallbacks(&control_callbacks);
+  response_char = service->createCharacteristic(
+      kResponseUuid, NIMBLE_PROPERTY::NOTIFY | kReadSecure, kMaxMtu);
+  if (!service->start()) {
+    aqlog.println("BLE ERROR operation=service-start");
+    return false;
+  }
+
+  NimBLEAdvertising *advertiser = NimBLEDevice::getAdvertising();
+  advertiser->setName(name_text);
+  advertiser->addServiceUUID(kServiceUuid);
+  advertiser->enableScanResponse(true);
+  if (!advertiser->start()) {
+    aqlog.println("BLE ERROR operation=advertise");
+    return false;
+  }
+  enabled = true;
+  advertising = true;
+  touch_ui();
+  aqlog.printf("BLE BEGIN name=%s service=%s mtu_max=%u bonds=%lu pair=%s\n",
+               name_text, kServiceUuid, unsigned(kMaxMtu),
+               static_cast<unsigned long>(bonds.load()),
+               config::pair_name(mode));
+  return true;
+}
+
+const char *local_name() { return name_text; }
+const char *info_json() { return info_text; }
+config::PairMode pair_mode() { return mode; }
+
+void clear_bonds() {
+  NimBLEDevice::deleteAllBonds();
+  bonds = static_cast<std::uint32_t>(NimBLEDevice::getNumBonds());
+  touch_ui();
+  aqlog.printf("BLE BONDS CLEARED bonds=%lu\n",
+               static_cast<unsigned long>(bonds.load()));
+}
+
+void publish_live(const char *json, std::size_t length) {
+  if (!enabled.load() || !live_char)
+    return;
+  live_char->setValue(reinterpret_cast<const std::uint8_t *>(json), length);
+  if (connected.load() && authenticated.load())
+    live_char->notify(reinterpret_cast<const std::uint8_t *>(json), length,
+                      conn_handle.load());
+}
+
+void publish_status(const char *json, std::size_t length) {
+  if (!enabled.load() || !status_char)
+    return;
+  status_char->setValue(reinterpret_cast<const std::uint8_t *>(json), length);
+  if (connected.load() && authenticated.load())
+    status_char->notify(reinterpret_cast<const std::uint8_t *>(json), length,
+                        conn_handle.load());
+}
+
+bool send_response(const std::uint8_t *frame, std::size_t length) {
+  return notify(response_char, frame, length);
+}
+
+bool send_error(Op op, Error code, const char *detail) {
+  std::uint8_t frame[3 + 64];
+  frame[0] = kFrameError;
+  frame[1] = static_cast<std::uint8_t>(op);
+  frame[2] = static_cast<std::uint8_t>(code);
+  std::size_t length = 3;
+  if (detail) {
+    const std::size_t detail_length = std::strlen(detail);
+    const std::size_t copy = detail_length > 64 ? 64 : detail_length;
+    std::memcpy(frame + 3, detail, copy);
+    length += copy;
+  }
+  aqlog.printf("BLE ERROR op=0x%02x code=%u\n", unsigned(op), unsigned(code));
+  return send_response(frame, length);
+}
+
+std::uint16_t payload_max() {
+  const auto current = mtu.load();
+  return current > 3 ? static_cast<std::uint16_t>(current - 3) : 0;
+}
+
+std::uint32_t connection_generation() { return generation.load(); }
+
+PairingState pairing() {
+  PairingState state;
+  state.active = pairing_active.load();
+  state.passkey = passkey.load();
+  state.deadline_us = pairing_deadline.load();
+  if (state.active && esp_timer_get_time() > state.deadline_us)
+    state.active = false;
+  return state;
+}
+
+LinkState link() {
+  LinkState state;
+  state.enabled = enabled.load();
+  state.advertising = advertising.load();
+  state.connected = connected.load();
+  state.authenticated = authenticated.load();
+  state.mtu = mtu.load();
+  state.bonds = bonds.load();
+  return state;
+}
+
+std::uint32_t ui_generation() { return ui.load(); }
+} // namespace ble

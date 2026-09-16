@@ -1,8 +1,11 @@
 #include "telemetry_logger.h"
+#include "debug_log.h"
+#include "device_config.h"
 #include "ltr553.h"
 #include "lz4_codec.h"
 #include "parquet_writer.h"
 #include "telemetry_contract.h"
+#include "wifi_link.h"
 
 #include <Arduino.h>
 #include <M5Unified.h>
@@ -45,8 +48,11 @@ struct WriterState {
   Lz4Workspace lz4{};
 };
 struct Command {
+  enum class Source : std::uint8_t { Serial, Control };
+  Source source = Source::Serial;
   char text[448]{};
   std::int64_t received_mono_us = 0;
+  ble::ControlRequest control{};
 };
 WriterState *writer_state = nullptr;
 QueueHandle_t samples = nullptr;
@@ -56,8 +62,17 @@ Ltr553 light_sensor;
 std::atomic<std::uint32_t> dropped{0}, errors{0}, finalized{0}, buffered{0};
 std::atomic<std::uint32_t> write_us{0}, sync_us{0}, queue_peak{0};
 std::atomic<std::uint32_t> total_kib{0}, used_kib{0}, rotation_seconds{900};
+// Worker state mirrored for the BLE `status` document, which any task may
+// build.
+std::atomic<std::uint32_t> partials_seen{0};
+std::atomic<bool> worker_failed{false}, storage_ok{false};
 std::int64_t boot_hi = 0, boot_lo = 0, device = 0, next_sample_us = 0;
-std::int64_t sample_sequence = 0, missed_deadlines = 0;
+std::int64_t sample_sequence = 0;
+std::atomic<std::int64_t> missed_deadlines{0};
+// Worker liveness: the loop stamps this every pass; poll_logger warns when it
+// stops moving, so a wedged worker is visible on serial instead of silent.
+std::atomic<std::int64_t> worker_heartbeat_us{0};
+TaskHandle_t worker_task = nullptr;
 char boot_text[33]{};
 char device_text[13]{};
 char station_text[37]{};
@@ -247,7 +262,7 @@ bool write_batch(std::size_t count, bool benchmark = false,
   std::snprintf(directory, sizeof(directory), "%s/%s", kDirectory, partition);
   if (!make_directories(directory)) {
     ++errors;
-    Serial.println("PARQUET ERROR operation=mkdir");
+    aqlog.println("PARQUET ERROR operation=mkdir");
     return false;
   }
   std::snprintf(name, sizeof(name), "%s/%s_%s_%lld-%lld-%lu", partition, prefix,
@@ -269,8 +284,8 @@ bool write_batch(std::size_t count, bool benchmark = false,
   }
   if (!file) {
     ++errors;
-    Serial.printf("PARQUET ERROR operation=create errno=%d buffered=%u\n",
-                  errno, unsigned(count));
+    aqlog.printf("PARQUET ERROR operation=create errno=%d buffered=%u\n", errno,
+                 unsigned(count));
     return false;
   }
   // Internal RAM staging is deliberately distinct from the PSRAM row buffer.
@@ -341,14 +356,14 @@ bool write_batch(std::size_t count, bool benchmark = false,
   write_us = static_cast<std::uint32_t>(esp_timer_get_time() - started);
   if (!ok) {
     ++errors;
-    Serial.printf("PARQUET ERROR operation=write file=%s reason=%s errno=%d "
-                  "buffered=%u\n",
-                  name, result.error ? result.error : "io-or-validation", errno,
-                  unsigned(count));
+    aqlog.printf("PARQUET ERROR operation=write file=%s reason=%s errno=%d "
+                 "buffered=%u\n",
+                 name, result.error ? result.error : "io-or-validation", errno,
+                 unsigned(count));
     return false;
   }
   ++finalized;
-  Serial.printf(
+  aqlog.printf(
       "PARQUET READY name=%s.parquet rows=%u first=%lld last=%lld "
       "bytes=%lu crc32=%08lx write_us=%lu sync_us=%lu heap_free=%lu "
       "psram_free=%lu stack_free=%u codec=%s codec_us=%llu "
@@ -381,7 +396,18 @@ bool safe_name(const char *name) {
          std::strstr(name, "//") == nullptr;
 }
 
+// One finalized-file entry from a listing. `name` already carries the export
+// prefix ("legacy-parquet/" for the pre-Hive directory).
+using FileEmitter = void (*)(void *context, const char *name,
+                             std::uint32_t bytes);
+
+void emit_file_serial(void *, const char *name, std::uint32_t bytes) {
+  aqlog.printf("PARQUET FILE name=%s bytes=%lu\n", name,
+               static_cast<unsigned long>(bytes));
+}
+
 void list_directory(const char *relative, unsigned depth, unsigned &partials,
+                    FileEmitter emit, void *context,
                     const char *base = kDirectory,
                     const char *export_prefix = "") {
   if (depth > 6)
@@ -395,7 +421,7 @@ void list_directory(const char *relative, unsigned depth, unsigned &partials,
     directory = ::opendir(directory_path);
   }
   if (!directory) {
-    Serial.println("PARQUET ERROR operation=list");
+    aqlog.println("PARQUET ERROR operation=list");
     return;
   }
   for (;;) {
@@ -423,11 +449,13 @@ void list_directory(const char *relative, unsigned depth, unsigned &partials,
     if (stat_result != 0)
       continue;
     if (S_ISDIR(info.st_mode))
-      list_directory(name, depth + 1, partials, base, export_prefix);
-    else if (safe_name(name))
-      Serial.printf("PARQUET FILE name=%s%s bytes=%lu\n", export_prefix, name,
-                    static_cast<unsigned long>(info.st_size));
-    else if (std::strstr(name, ".partial"))
+      list_directory(name, depth + 1, partials, emit, context, base,
+                     export_prefix);
+    else if (safe_name(name)) {
+      char exported[400];
+      std::snprintf(exported, sizeof(exported), "%s%s", export_prefix, name);
+      emit(context, exported, static_cast<std::uint32_t>(info.st_size));
+    } else if (std::strstr(name, ".partial"))
       ++partials;
   }
   {
@@ -436,9 +464,10 @@ void list_directory(const char *relative, unsigned depth, unsigned &partials,
   }
 }
 
-void list_files() {
+// Walks the output tree and the legacy directory; returns retained partials.
+unsigned list_all(FileEmitter emit, void *context) {
   unsigned partials = 0;
-  list_directory("", 0, partials);
+  list_directory("", 0, partials, emit, context);
   struct stat legacy{};
   bool has_legacy;
   {
@@ -446,25 +475,38 @@ void list_files() {
     has_legacy = ::stat("/sd/parquet", &legacy) == 0 && S_ISDIR(legacy.st_mode);
   }
   if (has_legacy)
-    list_directory("", 0, partials, "/sd/parquet", "legacy-parquet/");
-  Serial.printf("PARQUET PARTIAL retained=%u recovery=not-implemented\n",
-                partials);
-  Serial.println("PARQUET LIST END");
+    list_directory("", 0, partials, emit, context, "/sd/parquet",
+                   "legacy-parquet/");
+  partials_seen = partials;
+  return partials;
+}
+
+void list_files() {
+  const unsigned partials = list_all(emit_file_serial, nullptr);
+  aqlog.printf("PARQUET PARTIAL retained=%u recovery=not-implemented\n",
+               partials);
+  aqlog.println("PARQUET LIST END");
+}
+
+bool resolve_path(const char *name, char *path, std::size_t size) {
+  if (!safe_name(name))
+    return false;
+  if (std::strncmp(name, "legacy-parquet/", 15) == 0)
+    std::snprintf(path, size, "/sd/parquet/%.369s", name + 15);
+  else
+    std::snprintf(path, size, "%s/%.384s", kDirectory, name);
+  return true;
 }
 
 void send_file(const char *name) {
-  if (!safe_name(name)) {
-    Serial.println("PARQUET ERROR operation=get reason=invalid-name");
+  char path[416];
+  if (!resolve_path(name, path, sizeof(path))) {
+    aqlog.println("PARQUET ERROR operation=get reason=invalid-name");
     return;
   }
-  char path[416];
-  if (std::strncmp(name, "legacy-parquet/", 15) == 0)
-    std::snprintf(path, sizeof(path), "/sd/parquet/%.369s", name + 15);
-  else
-    std::snprintf(path, sizeof(path), "%s/%.384s", kDirectory, name);
   std::uint32_t size = 0, expected_crc = 0;
   if (!finalized_file(path, size, expected_crc)) {
-    Serial.println("PARQUET ERROR operation=get reason=invalid-file");
+    aqlog.println("PARQUET ERROR operation=get reason=invalid-file");
     return;
   }
   FILE *file;
@@ -473,11 +515,11 @@ void send_file(const char *name) {
     file = std::fopen(path, "rb");
   }
   if (!file) {
-    Serial.println("PARQUET ERROR operation=get reason=open");
+    aqlog.println("PARQUET ERROR operation=get reason=open");
     return;
   }
-  Serial.printf("PARQUET DATA BEGIN name=%s bytes=%lu\n", name,
-                static_cast<unsigned long>(size));
+  aqlog.printf("PARQUET DATA BEGIN name=%s bytes=%lu\n", name,
+               static_cast<unsigned long>(size));
   std::uint8_t block[256];
   char hex[513];
   constexpr char digits[] = "0123456789abcdef";
@@ -495,8 +537,8 @@ void send_file(const char *name) {
       hex[2 * i + 1] = digits[block[i] & 15];
     }
     hex[2 * count] = '\0';
-    Serial.printf("PARQUET DATA offset=%lu hex=%s\n",
-                  static_cast<unsigned long>(offset), hex);
+    aqlog.printf("PARQUET DATA offset=%lu hex=%s\n",
+                 static_cast<unsigned long>(offset), hex);
     offset += count;
     delay(1);
   }
@@ -504,9 +546,597 @@ void send_file(const char *name) {
     BusLock lock;
     std::fclose(file);
   }
-  Serial.printf("PARQUET DATA END name=%s bytes=%lu crc32=%08lx\n", name,
-                static_cast<unsigned long>(offset),
-                static_cast<unsigned long>(expected_crc));
+  aqlog.printf("PARQUET DATA END name=%s bytes=%lu crc32=%08lx\n", name,
+               static_cast<unsigned long>(offset),
+               static_cast<unsigned long>(expected_crc));
+}
+
+// Shared by `parquet time` and the BLE SET_TIME op. False for a bad epoch.
+bool set_clock(std::int64_t seconds, std::int64_t mono) {
+  if (seconds < 1577836800LL || seconds > 4102444800LL)
+    return false;
+  portENTER_CRITICAL(&clock_mutex);
+  anchor_mono_us = mono;
+  anchor_utc_ns = seconds * 1000000000;
+  ++clock_generation;
+  portEXIT_CRITICAL(&clock_mutex);
+  return true;
+}
+
+// ---- BLE `status` document and control handlers (docs/ble-sync-protocol.md)
+
+std::size_t build_status_json(char *out, std::size_t size) {
+  std::int32_t generation;
+  portENTER_CRITICAL(&clock_mutex);
+  generation = clock_generation;
+  portEXIT_CRITICAL(&clock_mutex);
+  const int written = std::snprintf(
+      out, size,
+      "{\"up_s\":%lu,\"int_s\":%lu,\"buf\":%lu,\"fin\":%lu,\"drop\":%lu,"
+      "\"err\":%lu,\"miss\":%lld,\"fail\":%u,\"codec\":\"%s\",\"utc\":%u,"
+      "\"gen\":%ld,\"sd\":%u,\"sd_kib\":%lu,\"sd_used_kib\":%lu,\"heap\":%lu,"
+      "\"part\":%lu}",
+      static_cast<unsigned long>(esp_timer_get_time() / 1000000),
+      static_cast<unsigned long>(rotation_seconds.load()),
+      static_cast<unsigned long>(buffered.load()),
+      static_cast<unsigned long>(finalized.load()),
+      static_cast<unsigned long>(dropped.load()),
+      static_cast<unsigned long>(errors.load()),
+      static_cast<long long>(missed_deadlines.load()),
+      worker_failed.load() ? 1U : 0U, codec_name(selected_codec),
+      generation ? 1U : 0U, static_cast<long>(generation),
+      storage_ok.load() ? 1U : 0U, static_cast<unsigned long>(total_kib.load()),
+      static_cast<unsigned long>(used_kib.load()),
+      static_cast<unsigned long>(ESP.getFreeHeap()),
+      static_cast<unsigned long>(partials_seen.load()));
+  return written > 0 && std::size_t(written) < size ? std::size_t(written) : 0;
+}
+
+void publish_status() {
+  char json[ble::kMaxJson + 16];
+  const std::size_t length = build_status_json(json, sizeof(json));
+  if (length && length <= ble::kMaxJson) {
+    ble::publish_status(json, length);
+    lan::publish_status(json, length);
+  }
+}
+
+// Builds the `live` snapshot from the row that was just queued. Keys are
+// omitted for null values; the document must stay <= kMaxJson bytes.
+void publish_live(const Sample &row) {
+  char json[ble::kMaxJson + 96];
+  std::size_t used = 0;
+  auto put = [&](const char *format, auto... args) {
+    if (used >= sizeof(json))
+      return;
+    const int written =
+        std::snprintf(json + used, sizeof(json) - used, format, args...);
+    if (written > 0)
+      used += std::size_t(written);
+  };
+  auto i32 = [&](Field field) {
+    std::int32_t value;
+    std::memcpy(&value, &row.data[field], sizeof(value));
+    return static_cast<long>(value);
+  };
+  auto i64 = [&](Field field) {
+    return static_cast<long long>(row.data[field]);
+  };
+  put("{\"seq\":%lld,\"mono\":%lld", i64(sequence), i64(monotonic_us));
+  if (row.valid[event_time_utc_ns])
+    put(",\"utc\":%lld", i64(event_time_utc_ns));
+  put(",\"pms\":%ld", i32(pms_status));
+  if (row.valid[pm25_atmospheric_ug_m3]) {
+    put(",\"pm1\":%ld,\"pm25\":%ld,\"pm10\":%ld", i32(pm1_atmospheric_ug_m3),
+        i32(pm25_atmospheric_ug_m3), i32(pm10_atmospheric_ug_m3));
+    put(",\"c1\":%ld,\"c25\":%ld,\"c10\":%ld", i32(pm1_cf1_ug_m3),
+        i32(pm25_cf1_ug_m3), i32(pm10_cf1_ug_m3));
+    put(",\"n03\":%ld,\"n05\":%ld,\"n1\":%ld,\"n25\":%ld,\"n5\":%ld,\"n10\":%"
+        "ld",
+        i32(particles_gt03_per_01l), i32(particles_gt05_per_01l),
+        i32(particles_gt10_per_01l), i32(particles_gt25_per_01l),
+        i32(particles_gt50_per_01l), i32(particles_gt100_per_01l));
+  }
+  if (row.valid[imu_temperature_c]) {
+    float temperature;
+    std::memcpy(&temperature, &row.data[imu_temperature_c],
+                sizeof(temperature));
+    put(",\"t\":%.1f", static_cast<double>(temperature));
+  }
+  if (row.valid[battery_mv])
+    put(",\"bat\":%ld", i32(battery_mv));
+  if (row.valid[battery_percent])
+    put(",\"pct\":%ld", i32(battery_percent));
+  if (row.valid[charging_status])
+    put(",\"chg\":%ld", i32(charging_status));
+  if (row.valid[vbus_mv])
+    put(",\"vbus\":%ld", i32(vbus_mv));
+  if (row.valid[light_ch0_raw])
+    put(",\"als\":%ld", i32(light_ch0_raw));
+  put("}");
+  if (used < sizeof(json) && used <= ble::kMaxJson) {
+    ble::publish_live(json, used);
+    lan::publish_live(json, used);
+  }
+}
+
+struct OpenFile {
+  FILE *file = nullptr;
+  std::uint16_t handle = 0;
+  std::uint32_t size = 0;
+  std::uint32_t crc = 0;
+  std::uint32_t generation = 0;
+  ble::Link link = ble::Link::Ble;
+};
+OpenFile open_file;
+std::uint16_t next_handle = 1;
+
+// The request being executed; handlers answer on its link.
+const ble::ControlRequest *current_request = nullptr;
+
+std::uint32_t link_generation(ble::Link link) {
+  return link == ble::Link::Lan ? lan::connection_generation()
+                                : ble::connection_generation();
+}
+std::uint16_t link_payload_max() {
+  if (current_request && current_request->link == ble::Link::Lan)
+    return lan::payload_max();
+  // GATT attribute values are at most 512 bytes; Android's stack silently
+  // discards larger notifications while macOS accepts them (measured
+  // 2026-09-17: every 514-byte CHUNK vanished on a OnePlus, the short final
+  // chunk arrived). So a BLE frame never exceeds 512 even at MTU 517.
+  const std::uint16_t raw = ble::payload_max();
+  return raw > ble::kMaxFrame ? ble::kMaxFrame : raw;
+}
+bool respond(const std::uint8_t *frame, std::size_t length) {
+  // A long LIST or READ is progress, not a stall: stamp the heartbeat per
+  // frame so the stall detector only fires when sending truly stops.
+  worker_heartbeat_us = esp_timer_get_time();
+  return current_request && current_request->link == ble::Link::Lan
+             ? lan::send_response(frame, length)
+             : ble::send_response(frame, length);
+}
+bool respond_error(ble::Op op, ble::Error code, const char *detail) {
+  return current_request && current_request->link == ble::Link::Lan
+             ? lan::send_error(op, code, detail)
+             : ble::send_error(op, code, detail);
+}
+// A handle is only honoured on the link that opened it.
+bool handle_matches(std::uint16_t handle) {
+  return open_file.file && handle == open_file.handle && current_request &&
+         current_request->link == open_file.link;
+}
+
+void close_open_file() {
+  if (open_file.file) {
+    BusLock lock;
+    std::fclose(open_file.file);
+  }
+  open_file = OpenFile{};
+}
+
+// Drop the handle when the connection that opened it is gone.
+void reconcile_open_file() {
+  if (open_file.file && open_file.generation != link_generation(open_file.link))
+    close_open_file();
+}
+
+void put_u16(std::uint8_t *out, std::uint16_t value) {
+  out[0] = value & 0xff;
+  out[1] = value >> 8;
+}
+void put_u32(std::uint8_t *out, std::uint32_t value) {
+  for (unsigned i = 0; i < 4; ++i)
+    out[i] = (value >> (8 * i)) & 0xff;
+}
+void put_i64(std::uint8_t *out, std::int64_t value) {
+  const auto bits = static_cast<std::uint64_t>(value);
+  for (unsigned i = 0; i < 8; ++i)
+    out[i] = (bits >> (8 * i)) & 0xff;
+}
+std::uint16_t get_u16(const std::uint8_t *in) {
+  return static_cast<std::uint16_t>(in[0] | (in[1] << 8));
+}
+std::uint32_t get_u32(const std::uint8_t *in) {
+  return std::uint32_t(in[0]) | (std::uint32_t(in[1]) << 8) |
+         (std::uint32_t(in[2]) << 16) | (std::uint32_t(in[3]) << 24);
+}
+std::int64_t get_i64(const std::uint8_t *in) {
+  std::uint64_t bits = 0;
+  for (unsigned i = 0; i < 8; ++i)
+    bits |= std::uint64_t(in[i]) << (8 * i);
+  return static_cast<std::int64_t>(bits);
+}
+
+struct ListContext {
+  std::uint16_t count = 0;
+  bool ok = true;
+};
+
+void emit_file_ble(void *context, const char *name, std::uint32_t bytes) {
+  auto *list = static_cast<ListContext *>(context);
+  if (!list->ok)
+    return;
+  const std::size_t name_length = std::strlen(name);
+  const std::size_t payload_max = link_payload_max();
+  if (payload_max < 6 || name_length + 5 > payload_max) {
+    // Cannot fit this entry; the phone will not see it. Counted honestly.
+    aqlog.printf("BLE LIST SKIP name_bytes=%u payload_max=%u\n",
+                 unsigned(name_length), unsigned(payload_max));
+    return;
+  }
+  std::uint8_t frame[5 + 400];
+  frame[0] = ble::kFrameFile;
+  put_u32(frame + 1, bytes);
+  std::memcpy(frame + 5, name, name_length);
+  if (!respond(frame, 5 + name_length)) {
+    // The peer will see no LIST_END and time out; say so on serial.
+    aqlog.printf("BLE LIST ABORT after=%u reason=notify-refused\n",
+                 unsigned(list->count));
+    list->ok = false;
+    return;
+  }
+  ++list->count;
+}
+
+void ble_list() {
+  ListContext list;
+  const unsigned partials = list_all(emit_file_ble, &list);
+  if (!list.ok)
+    return;
+  std::uint8_t frame[13];
+  frame[0] = ble::kFrameListEnd;
+  put_u16(frame + 1, list.count);
+  put_u16(frame + 3,
+          static_cast<std::uint16_t>(partials > 65535 ? 65535 : partials));
+  put_u32(frame + 5, total_kib.load());
+  put_u32(frame + 9, used_kib.load());
+  respond(frame, sizeof(frame));
+}
+
+void ble_open(const std::uint8_t *name_bytes, std::size_t name_length) {
+  char name[400];
+  if (name_length == 0 || name_length >= sizeof(name)) {
+    respond_error(ble::kOpOpen, ble::kErrInvalidName, "length");
+    return;
+  }
+  std::memcpy(name, name_bytes, name_length);
+  name[name_length] = '\0';
+  char path[416];
+  if (!resolve_path(name, path, sizeof(path))) {
+    respond_error(ble::kOpOpen, ble::kErrInvalidName, "charset");
+    return;
+  }
+  close_open_file();
+  std::uint32_t size = 0, crc = 0;
+  if (!finalized_file(path, size, crc)) {
+    respond_error(ble::kOpOpen, ble::kErrNotFinalized, name);
+    return;
+  }
+  FILE *file;
+  {
+    BusLock lock;
+    file = std::fopen(path, "rb");
+  }
+  if (!file) {
+    respond_error(ble::kOpOpen, ble::kErrOpenFailed, name);
+    return;
+  }
+  open_file.file = file;
+  open_file.handle = next_handle++;
+  if (next_handle == 0)
+    next_handle = 1;
+  open_file.size = size;
+  open_file.crc = crc;
+  open_file.link = current_request ? current_request->link : ble::Link::Ble;
+  open_file.generation = link_generation(open_file.link);
+  std::uint8_t frame[11 + 400];
+  frame[0] = ble::kFrameOpened;
+  put_u16(frame + 1, open_file.handle);
+  put_u32(frame + 3, size);
+  put_u32(frame + 7, crc);
+  std::memcpy(frame + 11, name, name_length);
+  aqlog.printf("BLE OPEN handle=%u bytes=%lu crc32=%08lx name=%s\n",
+               unsigned(open_file.handle), static_cast<unsigned long>(size),
+               static_cast<unsigned long>(crc), name);
+  respond(frame, 11 + name_length);
+}
+
+void ble_read(std::uint16_t handle, std::uint32_t offset,
+              std::uint32_t length) {
+  auto end = [&](std::uint32_t next, ble::Error status) {
+    std::uint8_t frame[8];
+    frame[0] = ble::kFrameReadEnd;
+    put_u16(frame + 1, handle);
+    put_u32(frame + 3, next);
+    frame[7] = static_cast<std::uint8_t>(status);
+    respond(frame, sizeof(frame));
+  };
+  if (!handle_matches(handle)) {
+    respond_error(ble::kOpRead, ble::kErrBadHandle, nullptr);
+    return;
+  }
+  if (offset > open_file.size) {
+    respond_error(ble::kOpRead, ble::kErrRange, nullptr);
+    return;
+  }
+  if (length > ble::kMaxRead)
+    length = ble::kMaxRead;
+  if (offset + length > open_file.size)
+    length = open_file.size - offset;
+  const std::size_t payload_max = link_payload_max();
+  if (payload_max <= 7) {
+    end(offset, ble::kErrBusy);
+    return;
+  }
+  constexpr std::size_t kChunkCap = lan::kPayloadMax - 7;
+  const std::size_t chunk_max =
+      payload_max - 7 > kChunkCap ? kChunkCap : payload_max - 7;
+  bool seek_ok;
+  {
+    BusLock lock;
+    seek_ok =
+        std::fseek(open_file.file, static_cast<long>(offset), SEEK_SET) == 0;
+  }
+  if (!seek_ok) {
+    end(offset, ble::kErrOpenFailed);
+    return;
+  }
+  std::uint8_t frame[7 + kChunkCap];
+  std::uint32_t sent = 0;
+  while (sent < length) {
+    const std::size_t want =
+        length - sent < chunk_max ? std::size_t(length - sent) : chunk_max;
+    std::size_t count;
+    {
+      BusLock lock;
+      count = std::fread(frame + 7, 1, want, open_file.file);
+    }
+    if (count == 0) {
+      end(offset + sent, ble::kErrOpenFailed);
+      return;
+    }
+    frame[0] = ble::kFrameChunk;
+    put_u16(frame + 1, handle);
+    put_u32(frame + 3, offset + sent);
+    if (!respond(frame, 7 + count)) {
+      end(offset + sent, ble::kErrBusy);
+      return;
+    }
+    sent += count;
+  }
+  aqlog.printf("BLE READ handle=%u offset=%lu bytes=%lu\n", unsigned(handle),
+               static_cast<unsigned long>(offset),
+               static_cast<unsigned long>(sent));
+  end(offset + sent, static_cast<ble::Error>(0));
+}
+
+void ble_close(std::uint16_t handle) {
+  if (!handle_matches(handle)) {
+    respond_error(ble::kOpClose, ble::kErrBadHandle, nullptr);
+    return;
+  }
+  close_open_file();
+  std::uint8_t frame[3];
+  frame[0] = ble::kFrameClosed;
+  put_u16(frame + 1, handle);
+  respond(frame, sizeof(frame));
+}
+
+void send_config() {
+  const lan::Status wifi = lan::status();
+  config::WifiView view{wifi.state,
+                        wifi.ip,
+                        wifi.rssi,
+                        wifi.mac,
+                        wifi.authenticated ? 1U : 0U,
+                        wifi.host,
+                        ble::link().bonds};
+  std::uint8_t frame[2 + 400];
+  const std::size_t length =
+      config::build_json(reinterpret_cast<char *>(frame + 2), 400, view);
+  if (!length) {
+    respond_error(ble::kOpGetConfig, ble::kErrMalformed, "json");
+    return;
+  }
+  frame[0] = ble::kFrameConfig;
+  frame[1] = config::reboot_required() ? 1 : 0;
+  respond(frame, 2 + length);
+}
+
+void send_log_tail(std::uint16_t max_bytes) {
+  static char text[DebugLog::kRingBytes];
+  std::uint32_t total = 0;
+  const std::size_t wanted =
+      max_bytes > DebugLog::kRingBytes ? DebugLog::kRingBytes : max_bytes;
+  const std::size_t count = aqlog.tail(text, wanted, total);
+  const std::size_t payload_max = link_payload_max();
+  std::uint8_t frame[1 + lan::kPayloadMax];
+  std::size_t sent = 0;
+  if (payload_max > 1) {
+    const std::size_t slice_max =
+        payload_max - 1 > lan::kPayloadMax ? lan::kPayloadMax : payload_max - 1;
+    while (sent < count) {
+      const std::size_t slice =
+          count - sent < slice_max ? count - sent : slice_max;
+      frame[0] = ble::kFrameLog;
+      std::memcpy(frame + 1, text + sent, slice);
+      if (!respond(frame, 1 + slice))
+        break;
+      sent += slice;
+    }
+  }
+  std::uint8_t end[7];
+  end[0] = ble::kFrameLogEnd;
+  put_u32(end + 1, total);
+  put_u16(end + 5, static_cast<std::uint16_t>(sent));
+  respond(end, sizeof(end));
+}
+
+struct WorkerState {
+  std::size_t &count;
+  bool &failed;
+  bool storage_ready;
+};
+
+void handle_control_request(const ble::ControlRequest &request,
+                            WorkerState &state) {
+  reconcile_open_file();
+  const std::uint8_t *body = request.bytes + 1;
+  const std::size_t body_length = request.length - 1;
+  switch (request.bytes[0]) {
+  case ble::kOpList:
+    if (!state.storage_ready) {
+      respond_error(ble::kOpList, ble::kErrStorage, nullptr);
+      return;
+    }
+    ble_list();
+    return;
+  case ble::kOpOpen:
+    if (!state.storage_ready) {
+      respond_error(ble::kOpOpen, ble::kErrStorage, nullptr);
+      return;
+    }
+    ble_open(body, body_length);
+    return;
+  case ble::kOpRead:
+    if (body_length != 10) {
+      respond_error(ble::kOpRead, ble::kErrMalformed, nullptr);
+      return;
+    }
+    ble_read(get_u16(body), get_u32(body + 2), get_u32(body + 6));
+    return;
+  case ble::kOpClose:
+    if (body_length != 2) {
+      respond_error(ble::kOpClose, ble::kErrMalformed, nullptr);
+      return;
+    }
+    ble_close(get_u16(body));
+    return;
+  case ble::kOpSetTime: {
+    if (body_length != 8) {
+      respond_error(ble::kOpSetTime, ble::kErrMalformed, nullptr);
+      return;
+    }
+    const std::int64_t seconds = get_i64(body);
+    if (!set_clock(seconds, request.received_mono_us)) {
+      respond_error(ble::kOpSetTime, ble::kErrInvalidEpoch, nullptr);
+      return;
+    }
+    aqlog.printf("PARQUET TIME epoch_s=%lld source=ble monotonic_us=%lld\n",
+                 static_cast<long long>(seconds),
+                 static_cast<long long>(request.received_mono_us));
+    std::uint8_t frame[17];
+    frame[0] = ble::kFrameTimeSet;
+    put_i64(frame + 1, seconds);
+    put_i64(frame + 9, request.received_mono_us);
+    respond(frame, sizeof(frame));
+    publish_status();
+    return;
+  }
+  case ble::kOpFlush: {
+    if (!state.count || !state.storage_ready) {
+      respond_error(ble::kOpFlush, ble::kErrNothingToFlush, nullptr);
+      return;
+    }
+    const auto rows = static_cast<std::uint16_t>(state.count);
+    if (!write_batch(state.count)) {
+      state.failed = true;
+      worker_failed = true;
+      respond_error(ble::kOpFlush, ble::kErrStorage, "write");
+      publish_status();
+      return;
+    }
+    state.count = 0;
+    buffered = 0;
+    state.failed = false;
+    worker_failed = false;
+    std::uint8_t frame[7];
+    frame[0] = ble::kFrameFlushed;
+    put_u16(frame + 1, rows);
+    put_u32(frame + 3, finalized.load());
+    respond(frame, sizeof(frame));
+    publish_status();
+    return;
+  }
+  case ble::kOpStatus:
+    publish_status();
+    return;
+  case ble::kOpGetConfig:
+    send_config();
+    return;
+  case ble::kOpSetConfig: {
+    char bad_key[48];
+    config::Actions actions;
+    if (!config::apply_lines(reinterpret_cast<const char *>(body), body_length,
+                             bad_key, sizeof(bad_key), actions)) {
+      respond_error(ble::kOpSetConfig, ble::kErrInvalidConfig, bad_key);
+      return;
+    }
+    if (actions.clear_bonds)
+      ble::clear_bonds();
+    if (actions.rotate_token)
+      lan::drop_session();
+    if (actions.wifi_changed)
+      lan::apply_settings();
+    send_config();
+    return;
+  }
+  case ble::kOpReboot: {
+    // Never lose the RAM batch to a reboot the owner asked for.
+    if (state.count && state.storage_ready && !state.failed) {
+      if (write_batch(state.count)) {
+        state.count = 0;
+        buffered = 0;
+      } else {
+        state.failed = true;
+        worker_failed = true;
+      }
+    }
+    constexpr std::uint16_t kDelayMs = 500;
+    std::uint8_t frame[3];
+    frame[0] = ble::kFrameRebooting;
+    put_u16(frame + 1, kDelayMs);
+    respond(frame, sizeof(frame));
+    aqlog.printf("PARQUET REBOOT source=%s delay_ms=%u\n",
+                 request.link == ble::Link::Lan ? "lan" : "ble",
+                 unsigned(kDelayMs));
+    Serial.flush();
+    vTaskDelay(pdMS_TO_TICKS(kDelayMs));
+    esp_restart();
+    return;
+  }
+  case ble::kOpLogTail: {
+    if (body_length != 2) {
+      respond_error(ble::kOpLogTail, ble::kErrMalformed, nullptr);
+      return;
+    }
+    send_log_tail(get_u16(body));
+    return;
+  }
+  case ble::kOpGetToken: {
+    if (request.link != ble::Link::Ble) {
+      respond_error(ble::kOpGetToken, ble::kErrNotOnThisLink, "ble-only");
+      return;
+    }
+    const config::Settings settings = config::get();
+    std::uint8_t frame[3 + config::kTokenBytes];
+    frame[0] = ble::kFrameToken;
+    put_u16(frame + 1, config::kLanPort);
+    std::memcpy(frame + 3, settings.token, config::kTokenBytes);
+    respond(frame, sizeof(frame));
+    aqlog.println("LAN TOKEN issued=ble");
+    return;
+  }
+  case ble::kOpWifiScan:
+    // Normally intercepted in enqueue_request(); reaching here means the
+    // scan task already had one pending.
+    respond_error(ble::kOpWifiScan, ble::kErrBusy, "scan-pending");
+    return;
+  default:
+    respond_error(static_cast<ble::Op>(request.bytes[0]), ble::kErrUnknownOp,
+                  nullptr);
+  }
 }
 
 void storage_worker(void *) {
@@ -516,6 +1146,7 @@ void storage_worker(void *) {
     storage_ready =
         mounted && (::mkdir(kDirectory, 0700) == 0 || errno == EEXIST);
   }
+  storage_ok = storage_ready;
   if (storage_ready) {
     {
       BusLock lock;
@@ -525,14 +1156,15 @@ void storage_worker(void *) {
     list_files();
   } else {
     ++errors;
-    Serial.println("PARQUET ERROR operation=mount-or-directory "
-                   "samples_will_be_dropped=true");
+    aqlog.println("PARQUET ERROR operation=mount-or-directory "
+                  "samples_will_be_dropped=true");
   }
   std::size_t count = 0;
   bool failed = false;
   Sample row;
   Command command;
   for (;;) {
+    worker_heartbeat_us = esp_timer_get_time();
     if (xQueueReceive(samples, &row, pdMS_TO_TICKS(50)) == pdTRUE) {
       if (!storage_ready || failed || count == kMaxRows) {
         ++dropped;
@@ -570,42 +1202,50 @@ void storage_worker(void *) {
         }
       }
     }
+    worker_failed = failed;
     if (xQueueReceive(commands, &command, 0) != pdTRUE)
       continue;
+    if (command.source == Command::Source::Control) {
+      WorkerState state{count, failed, storage_ready};
+      current_request = &command.control;
+      handle_control_request(command.control, state);
+      current_request = nullptr;
+      continue;
+    }
     if (std::strcmp(command.text, "parquet status") == 0) {
-      Serial.printf(
-          "PARQUET STATUS interval_s=%lu buffered=%u finalized=%lu "
-          "dropped=%lu errors=%lu queue_peak=%lu failed=%s station=%s "
-          "codec=%s schema=%s config=%s deployment=unknown "
-          "calibration=unknown\n",
-          static_cast<unsigned long>(rotation_seconds.load()), unsigned(count),
-          static_cast<unsigned long>(finalized.load()),
-          static_cast<unsigned long>(dropped.load()),
-          static_cast<unsigned long>(errors.load()),
-          static_cast<unsigned long>(queue_peak.load()),
-          failed ? "true" : "false", station_text, codec_name(selected_codec),
-          kSchemaName, kConfigurationId);
+      aqlog.printf("PARQUET STATUS interval_s=%lu buffered=%u finalized=%lu "
+                   "dropped=%lu errors=%lu queue_peak=%lu failed=%s station=%s "
+                   "codec=%s schema=%s config=%s deployment=unknown "
+                   "calibration=unknown\n",
+                   static_cast<unsigned long>(rotation_seconds.load()),
+                   unsigned(count),
+                   static_cast<unsigned long>(finalized.load()),
+                   static_cast<unsigned long>(dropped.load()),
+                   static_cast<unsigned long>(errors.load()),
+                   static_cast<unsigned long>(queue_peak.load()),
+                   failed ? "true" : "false", station_text,
+                   codec_name(selected_codec), kSchemaName, kConfigurationId);
     } else if (std::strcmp(command.text, "parquet schema") == 0) {
-      Serial.printf("PARQUET SCHEMA BEGIN schema=%s columns=%u sha256=%s\n",
-                    kSchemaName, unsigned(field_count), kDictionarySha256);
+      aqlog.printf("PARQUET SCHEMA BEGIN schema=%s columns=%u sha256=%s\n",
+                   kSchemaName, unsigned(field_count), kDictionarySha256);
       for (const auto &field : kFields) {
-        Serial.printf("PARQUET FIELD name=%s type=%u procedure=%s unit=%s "
-                      "validity=%s property=%s\n",
-                      field.name, unsigned(field.type), field.procedure,
-                      field.unit, field.validity, field.property_uri);
+        aqlog.printf("PARQUET FIELD name=%s type=%u procedure=%s unit=%s "
+                     "validity=%s property=%s\n",
+                     field.name, unsigned(field.type), field.procedure,
+                     field.unit, field.validity, field.property_uri);
         delay(1);
       }
-      Serial.println("PARQUET SCHEMA END");
+      aqlog.println("PARQUET SCHEMA END");
     } else if (std::strcmp(command.text, "parquet codec-test") == 0) {
       if (!count || !storage_ready || failed) {
-        Serial.println("PARQUET ERROR operation=codec-test "
-                       "reason=empty-or-storage-failed");
+        aqlog.println("PARQUET ERROR operation=codec-test "
+                      "reason=empty-or-storage-failed");
       } else if (write_batch(count, true, Codec::Uncompressed) &&
                  write_batch(count, true, Codec::Lz4Raw)) {
         // Keep the original batch for normal telemetry rotation. Benchmark
         // copies live outside station trees and are explicitly labeled.
-        Serial.printf("PARQUET BENCH END rows=%u retained_for_telemetry=true\n",
-                      unsigned(count));
+        aqlog.printf("PARQUET BENCH END rows=%u retained_for_telemetry=true\n",
+                     unsigned(count));
       }
     } else if (std::strcmp(command.text, "parquet codec none") == 0 ||
                std::strcmp(command.text, "parquet codec lz4") == 0) {
@@ -618,8 +1258,8 @@ void storage_worker(void *) {
       failed = false;
       selected_codec =
           command.text[14] == 'l' ? Codec::Lz4Raw : Codec::Uncompressed;
-      Serial.printf("PARQUET CONFIG codec=%s persistent=false\n",
-                    codec_name(selected_codec));
+      aqlog.printf("PARQUET CONFIG codec=%s persistent=false\n",
+                   codec_name(selected_codec));
     } else if (std::strcmp(command.text, "parquet flush") == 0) {
       if (count && storage_ready) {
         if (write_batch(count)) {
@@ -628,7 +1268,7 @@ void storage_worker(void *) {
           failed = false;
         }
       } else
-        Serial.println(
+        aqlog.println(
             "PARQUET ERROR operation=flush reason=empty-or-no-storage");
     } else if (std::strcmp(command.text, "parquet interval 600") == 0 ||
                std::strcmp(command.text, "parquet interval 900") == 0) {
@@ -640,30 +1280,26 @@ void storage_worker(void *) {
       buffered = 0;
       failed = false;
       rotation_seconds = command.text[17] == '6' ? 600 : 900;
-      Serial.printf("PARQUET CONFIG interval_s=%lu persistent=false\n",
-                    static_cast<unsigned long>(rotation_seconds.load()));
+      aqlog.printf("PARQUET CONFIG interval_s=%lu persistent=false\n",
+                   static_cast<unsigned long>(rotation_seconds.load()));
     } else if (std::strncmp(command.text, "parquet time ", 13) == 0) {
       char *end = nullptr;
       const auto seconds = std::strtoll(command.text + 13, &end, 10);
-      if (seconds < 1577836800LL || seconds > 4102444800LL || !end || *end) {
-        Serial.println("PARQUET ERROR operation=time reason=invalid-epoch");
+      const auto mono = command.received_mono_us;
+      if (!end || *end || !set_clock(seconds, mono)) {
+        aqlog.println("PARQUET ERROR operation=time reason=invalid-epoch");
         continue;
       }
-      const auto mono = command.received_mono_us;
-      portENTER_CRITICAL(&clock_mutex);
-      anchor_mono_us = mono;
-      anchor_utc_ns = seconds * 1000000000;
-      ++clock_generation;
-      portEXIT_CRITICAL(&clock_mutex);
-      Serial.printf("PARQUET TIME epoch_s=%lld source=host monotonic_us=%lld\n",
-                    static_cast<long long>(seconds),
-                    static_cast<long long>(mono));
+      aqlog.printf("PARQUET TIME epoch_s=%lld source=host monotonic_us=%lld\n",
+                   static_cast<long long>(seconds),
+                   static_cast<long long>(mono));
+      publish_status();
     } else if (std::strcmp(command.text, "parquet list") == 0)
       list_files();
     else if (std::strncmp(command.text, "parquet get ", 12) == 0)
       send_file(command.text + 12);
     else
-      Serial.println("PARQUET ERROR operation=command reason=unknown-command");
+      aqlog.println("PARQUET ERROR operation=command reason=unknown-command");
   }
 }
 
@@ -775,7 +1411,7 @@ void collect(const PmsSnapshot &pms, std::int64_t now, std::int64_t scheduled) {
     row.counter(sd_used_bytes, std::int64_t(used_kib.load()) * 1024);
   }
   row.counter(rows_dropped, dropped.load());
-  row.counter(sample_deadlines_missed, missed_deadlines);
+  row.counter(sample_deadlines_missed, missed_deadlines.load());
   row.counter(storage_errors, errors.load());
   row.counter(files_finalized, finalized.load());
   row.counter(last_write_us, write_us.load());
@@ -788,16 +1424,18 @@ void collect(const PmsSnapshot &pms, std::int64_t now, std::int64_t scheduled) {
       static_cast<std::uint32_t>(uxQueueMessagesWaiting(samples));
   if (depth > queue_peak.load())
     queue_peak = depth;
-  Serial.printf("PARQUET ROW sequence=%lld monotonic_us=%lld jitter_us=%lld "
-                "pms_status=%d imu_mask=%u light_valid=%s proximity_valid=%s "
-                "buffered=%lu dropped=%lu\n",
-                static_cast<long long>(row.data[sequence]),
-                static_cast<long long>(now),
-                static_cast<long long>(now - scheduled), status,
-                unsigned(fresh), light.als_valid ? "true" : "false",
-                light.proximity_valid ? "true" : "false",
-                static_cast<unsigned long>(buffered.load()),
-                static_cast<unsigned long>(dropped.load()));
+  publish_live(row);
+  publish_status();
+  aqlog.printf("PARQUET ROW sequence=%lld monotonic_us=%lld jitter_us=%lld "
+               "pms_status=%d imu_mask=%u light_valid=%s proximity_valid=%s "
+               "buffered=%lu dropped=%lu\n",
+               static_cast<long long>(row.data[sequence]),
+               static_cast<long long>(now),
+               static_cast<long long>(now - scheduled), status, unsigned(fresh),
+               light.als_valid ? "true" : "false",
+               light.proximity_valid ? "true" : "false",
+               static_cast<unsigned long>(buffered.load()),
+               static_cast<unsigned long>(dropped.load()));
 }
 } // namespace
 
@@ -813,12 +1451,12 @@ void unlock_display() {
 void begin_logger(bool sd_mounted) {
   mounted = sd_mounted;
   if (!station_identity()) {
-    Serial.println("PARQUET ERROR operation=station-identity logging=false");
+    aqlog.println("PARQUET ERROR operation=station-identity logging=false");
     return;
   }
   std::uint8_t mac[6]{};
   if (esp_read_mac(mac, ESP_MAC_WIFI_STA) != ESP_OK) {
-    Serial.println("PARQUET ERROR operation=identity");
+    aqlog.println("PARQUET ERROR operation=identity");
     return;
   }
   device = std::accumulate(std::begin(mac), std::end(mac), std::int64_t{0},
@@ -836,24 +1474,24 @@ void begin_logger(bool sd_mounted) {
                 static_cast<unsigned long long>(boot_lo));
   spi_mutex = xSemaphoreCreateMutex();
   samples = xQueueCreate(8, sizeof(Sample));
-  commands = xQueueCreate(4, sizeof(Command));
+  commands = xQueueCreate(6, sizeof(Command));
   writer_state = static_cast<WriterState *>(heap_caps_calloc(
       1, sizeof(WriterState), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
   if (!spi_mutex || !samples || !commands || !writer_state) {
-    Serial.println("PARQUET ERROR operation=allocate logging=false");
+    aqlog.println("PARQUET ERROR operation=allocate logging=false");
     return;
   }
   new (writer_state) WriterState{};
   prepare_columns();
   const bool light = light_sensor.begin();
   next_sample_us = esp_timer_get_time() + kSampleUs;
-  if (xTaskCreate(storage_worker, "parquet-sd", 16384, nullptr, 1, nullptr) !=
-      pdPASS) {
-    Serial.println("PARQUET ERROR operation=task logging=false");
+  if (xTaskCreate(storage_worker, "parquet-sd", 24576, nullptr, 1,
+                  &worker_task) != pdPASS) {
+    aqlog.println("PARQUET ERROR operation=task logging=false");
     return;
   }
   accepting = true;
-  Serial.printf(
+  aqlog.printf(
       "PARQUET BEGIN schema=%s columns=%u sample_s=10 "
       "interval_s=900 max_rows=90 psram_workspace_bytes=%u row_bytes=%u "
       "boot=%s station=%s light_available=%s codec=UNCOMPRESSED\n",
@@ -866,6 +1504,42 @@ void poll_logger(const PmsSnapshot &pms) {
   if (!accepting)
     return;
   const auto now = esp_timer_get_time();
+  {
+    static std::int64_t last_stall_warning_us = 0;
+    const auto heartbeat = worker_heartbeat_us.load();
+    if (heartbeat && now - heartbeat > 5000000LL &&
+        now - last_stall_warning_us > 30000000LL) {
+      last_stall_warning_us = now;
+      const char *state_name = "?";
+      if (worker_task) {
+        switch (eTaskGetState(worker_task)) {
+        case eRunning:
+          state_name = "running";
+          break;
+        case eReady:
+          state_name = "ready";
+          break;
+        case eBlocked:
+          state_name = "blocked";
+          break;
+        case eSuspended:
+          state_name = "suspended";
+          break;
+        case eDeleted:
+          state_name = "deleted";
+          break;
+        default:
+          break;
+        }
+      }
+      aqlog.printf(
+          "PARQUET ERROR operation=worker-stall seconds=%lld "
+          "state=%s stack_free=%u\n",
+          static_cast<long long>((now - heartbeat) / 1000000), state_name,
+          worker_task ? unsigned(uxTaskGetStackHighWaterMark(worker_task))
+                      : 0U);
+    }
+  }
   if (now >= next_sample_us) {
     const auto skipped = (now - next_sample_us) / kSampleUs;
     missed_deadlines += skipped;
@@ -877,6 +1551,7 @@ void poll_logger(const PmsSnapshot &pms) {
   static Command input{};
   static std::size_t length = 0;
   static bool overflow = false;
+  input.source = Command::Source::Serial;
   for (unsigned limit = 0; limit < 128 && Serial.available(); ++limit) {
     const int byte = Serial.read();
     if (byte == '\r')
@@ -885,7 +1560,7 @@ void poll_logger(const PmsSnapshot &pms) {
       input.text[length] = '\0';
       input.received_mono_us = esp_timer_get_time();
       if (overflow || xQueueSend(commands, &input, 0) != pdTRUE)
-        Serial.println(
+        aqlog.println(
             "PARQUET ERROR operation=command reason=too-long-or-busy");
       length = 0;
       overflow = false;
@@ -897,4 +1572,43 @@ void poll_logger(const PmsSnapshot &pms) {
     }
   }
 }
+bool start_links(bool display_detected) {
+  if (!accepting)
+    return false;
+  config::load(display_detected);
+  const config::Settings settings = config::get();
+  static const ble::Identity identity{
+      station_text,          device_text,       boot_text, kSchemaName,
+      unsigned(field_count), kDictionarySha256, kFirmware};
+  const bool ble_ok = ble::begin(identity, settings.pair, settings.pin);
+  // mDNS host label mirrors the BLE name: AQ-6b40 -> aq-6b40.
+  char host[24];
+  std::snprintf(host, sizeof(host), "%s", ble::local_name());
+  for (char *p = host; *p; ++p)
+    if (*p >= 'A' && *p <= 'Z')
+      *p = static_cast<char>(*p - 'A' + 'a');
+  lan::begin(host);
+  return ble_ok;
+}
+
+bool enqueue_request(const ble::ControlRequest &request) {
+  if (!commands)
+    return false;
+  if (request.length && request.bytes[0] == ble::kOpWifiScan) {
+    // Scans block for seconds; they run on the LAN task, not the worker.
+    if (lan::request_scan(request.link, request.link_generation))
+      return true;
+    // Fall through to the worker, which answers "busy" on the right link.
+  }
+  static Command command;
+  command = Command{};
+  command.source = Command::Source::Control;
+  command.received_mono_us = request.received_mono_us;
+  command.control = request;
+  return xQueueSend(commands, &command, 0) == pdTRUE;
+}
+
+const char *station_text_id() { return station_text; }
+const char *device_text_id() { return device_text; }
+const char *firmware_text_id() { return kFirmware; }
 } // namespace telemetry

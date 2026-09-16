@@ -1,7 +1,11 @@
 #include <SD.h>
 #include <SPI.h>
 
+#include "ble_sync.h"
+#include "debug_log.h"
+#include "device_config.h"
 #include "telemetry_logger.h"
+#include "wifi_link.h"
 #include <M5Unified.h>
 
 #include <Arduino.h>
@@ -24,7 +28,8 @@ constexpr std::uint32_t kSerialBaud = 115200;
 constexpr std::uint32_t kI2cScanFrequency = 100000;
 constexpr std::uint32_t kPmsProbeDurationMs = 5000;
 constexpr std::uint32_t kDisplayIntervalMs = 10000;
-constexpr std::uint8_t kScreenPageCount = 3;
+constexpr std::uint8_t kScreenPageCount = 4;
+constexpr bool kEnableBle = true;
 constexpr int kMinimumSwipeDistance = 40;
 constexpr int kSdSck = 36;
 constexpr int kSdMiso = 35;
@@ -141,6 +146,8 @@ std::int64_t latest_pms_mono_us = 0;
 std::uint32_t pms_frame_count = 0;
 std::uint32_t last_display_ms = 0;
 std::uint8_t screen_page = 0;
+std::uint32_t last_ble_ui_generation = 0;
+bool ble_started = false;
 
 const char *board_name(m5::board_t board) {
   switch (board) {
@@ -252,7 +259,7 @@ void report_chip() {
   std::uint8_t mac[6]{};
   const esp_err_t mac_result = esp_read_mac(mac, ESP_MAC_WIFI_STA);
 
-  Serial.printf(
+  aqlog.printf(
       "DIAG chip model=%s revision=%u cores=%u features=0x%08lx reset=%s(%d) "
       "board=%s(%d)\n",
       ESP.getChipModel(), static_cast<unsigned>(chip.revision),
@@ -262,20 +269,20 @@ void report_chip() {
       static_cast<int>(esp_reset_reason()), board_name(M5.getBoard()),
       static_cast<int>(M5.getBoard()));
   if (mac_result == ESP_OK) {
-    Serial.printf("DIAG identity wifi_sta_mac=%02x:%02x:%02x:%02x:%02x:%02x\n",
-                  mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
+    aqlog.printf("DIAG identity wifi_sta_mac=%02x:%02x:%02x:%02x:%02x:%02x\n",
+                 mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
   } else {
-    Serial.printf("DIAG identity wifi_sta_mac=unavailable error=%d\n",
-                  mac_result);
+    aqlog.printf("DIAG identity wifi_sta_mac=unavailable error=%d\n",
+                 mac_result);
   }
-  Serial.printf("DIAG flash bytes=%lu speed_hz=%lu mode=%s\n",
-                static_cast<unsigned long>(ESP.getFlashChipSize()),
-                static_cast<unsigned long>(ESP.getFlashChipSpeed()),
-                flash_mode_name(ESP.getFlashChipMode()));
+  aqlog.printf("DIAG flash bytes=%lu speed_hz=%lu mode=%s\n",
+               static_cast<unsigned long>(ESP.getFlashChipSize()),
+               static_cast<unsigned long>(ESP.getFlashChipSpeed()),
+               flash_mode_name(ESP.getFlashChipMode()));
 }
 
 void report_memory() {
-  Serial.printf(
+  aqlog.printf(
       "DIAG memory heap_total=%lu heap_free=%lu heap_min_free=%lu "
       "heap_largest_internal=%lu psram_found=%s psram_total=%lu psram_free=%lu "
       "psram_largest=%lu\n",
@@ -305,9 +312,9 @@ void report_i2c() {
     if (std::strcmp(name, "unexpected") == 0) {
       ++unexpected;
     }
-    Serial.printf("DIAG i2c address=0x%02x device=%s\n", address, name);
+    aqlog.printf("DIAG i2c address=0x%02x device=%s\n", address, name);
   }
-  Serial.printf(
+  aqlog.printf(
       "DIAG i2c_summary sda=12 scl=11 frequency_hz=%lu found=%u unexpected=%u "
       "note_bmm150=behind_bmi270_aux_bus\n",
       static_cast<unsigned long>(kI2cScanFrequency), found, unexpected);
@@ -315,7 +322,7 @@ void report_i2c() {
 
 void report_power() {
   const auto charging = M5.Power.isCharging();
-  Serial.printf(
+  aqlog.printf(
       "DIAG power pmic_type=%d external_5v=%s usb_output=%s vbus_mv=%d "
       "battery_mv=%d battery_percent=%ld charging=%s battery_current_ma=%ld\n",
       static_cast<int>(M5.Power.getType()),
@@ -330,12 +337,12 @@ void report_power() {
 void report_rtc_imu_touch() {
   m5::rtc_datetime_t datetime{};
   if (M5.Rtc.isEnabled() && M5.Rtc.getDateTime(&datetime)) {
-    Serial.printf(
+    aqlog.printf(
         "DIAG rtc enabled=true date=%04d-%02d-%02d time=%02d:%02d:%02d\n",
         datetime.date.year, datetime.date.month, datetime.date.date,
         datetime.time.hours, datetime.time.minutes, datetime.time.seconds);
   } else {
-    Serial.println("DIAG rtc enabled=false_or_read_failed");
+    aqlog.println("DIAG rtc enabled=false_or_read_failed");
   }
 
   M5.Imu.update();
@@ -347,35 +354,34 @@ void report_rtc_imu_touch() {
   float gz = 0.0f;
   const bool accel_ok = M5.Imu.isEnabled() && M5.Imu.getAccel(&ax, &ay, &az);
   const bool gyro_ok = M5.Imu.isEnabled() && M5.Imu.getGyro(&gx, &gy, &gz);
-  Serial.printf(
-      "DIAG imu enabled=%s type=%d accel_ok=%s accel_g=%.4f,%.4f,%.4f "
-      "gyro_ok=%s gyro_dps=%.4f,%.4f,%.4f\n",
-      M5.Imu.isEnabled() ? "true" : "false", static_cast<int>(M5.Imu.getType()),
-      accel_ok ? "true" : "false", ax, ay, az, gyro_ok ? "true" : "false", gx,
-      gy, gz);
+  aqlog.printf("DIAG imu enabled=%s type=%d accel_ok=%s accel_g=%.4f,%.4f,%.4f "
+               "gyro_ok=%s gyro_dps=%.4f,%.4f,%.4f\n",
+               M5.Imu.isEnabled() ? "true" : "false",
+               static_cast<int>(M5.Imu.getType()), accel_ok ? "true" : "false",
+               ax, ay, az, gyro_ok ? "true" : "false", gx, gy, gz);
 
   M5.update();
-  Serial.printf("DIAG touch controller_ack=%s active_points=%u\n",
-                M5.In_I2C.scanID(0x38, kI2cScanFrequency) ? "true" : "false",
-                static_cast<unsigned>(M5.Touch.getCount()));
+  aqlog.printf("DIAG touch controller_ack=%s active_points=%u\n",
+               M5.In_I2C.scanID(0x38, kI2cScanFrequency) ? "true" : "false",
+               static_cast<unsigned>(M5.Touch.getCount()));
 }
 
 bool report_sd() {
   SPI.begin(kSdSck, kSdMiso, kSdMosi, kSdCs);
   if (!SD.begin(kSdCs, SPI, 25000000, "/sd", 5, false)) {
-    Serial.println("DIAG sd mounted=false status=missing_or_mount_failed "
-                   "format_attempted=false");
+    aqlog.println("DIAG sd mounted=false status=missing_or_mount_failed "
+                  "format_attempted=false");
     return false;
   }
 
   const std::uint8_t type = SD.cardType();
-  Serial.printf("DIAG sd mounted=true type=%u card_bytes=%llu total_bytes=%llu "
-                "used_bytes=%llu "
-                "clock_hz=25000000\n",
-                static_cast<unsigned>(type),
-                static_cast<unsigned long long>(SD.cardSize()),
-                static_cast<unsigned long long>(SD.totalBytes()),
-                static_cast<unsigned long long>(SD.usedBytes()));
+  aqlog.printf("DIAG sd mounted=true type=%u card_bytes=%llu total_bytes=%llu "
+               "used_bytes=%llu "
+               "clock_hz=25000000\n",
+               static_cast<unsigned>(type),
+               static_cast<unsigned long long>(SD.cardSize()),
+               static_cast<unsigned long long>(SD.totalBytes()),
+               static_cast<unsigned long long>(SD.usedBytes()));
   return true;
 }
 
@@ -403,7 +409,7 @@ bool start_pms() {
     delay(1);
   }
   if (!received) {
-    Serial.printf(
+    aqlog.printf(
         "DIAG pmsa003 status=no_valid_frame_within_timeout timeout_ms=%lu "
         "checksum_failures=%lu length_failures=%lu values_valid=false\n",
         static_cast<unsigned long>(kPmsProbeDurationMs),
@@ -412,7 +418,7 @@ bool start_pms() {
     return false;
   }
 
-  Serial.printf(
+  aqlog.printf(
       "DIAG pmsa003 status=frame_received values_valid=%s sensor_error=%u "
       "firmware=%u atmospheric_pm1_ug_m3=%u atmospheric_pm25_ug_m3=%u "
       "atmospheric_pm10_ug_m3=%u cf1_pm1_ug_m3=%u cf1_pm25_ug_m3=%u "
@@ -444,7 +450,7 @@ void poll_pms() {
 
 void print_periodic_pms() {
   if (!has_pms_frame) {
-    Serial.printf(
+    aqlog.printf(
         "MEAS pmsa003 values_valid=false interval_ms=%lu checksum_failures=%lu "
         "length_failures=%lu\n",
         static_cast<unsigned long>(kDisplayIntervalMs),
@@ -453,7 +459,7 @@ void print_periodic_pms() {
     return;
   }
 
-  Serial.printf(
+  aqlog.printf(
       "MEAS pmsa003 values_valid=%s sensor_error=%u frame_age_ms=%lu "
       "atmospheric_pm1_ug_m3=%u atmospheric_pm25_ug_m3=%u "
       "atmospheric_pm10_ug_m3=%u cf1_pm1_ug_m3=%u cf1_pm25_ug_m3=%u "
@@ -498,6 +504,24 @@ void draw_screen_header(const char *title) {
   M5.Display.setCursor(279, 10);
   M5.Display.printf("%u/%u", static_cast<unsigned>(screen_page + 1),
                     static_cast<unsigned>(kScreenPageCount));
+  if (ble_started) {
+    const auto link = ble::link();
+    M5.Display.setTextColor(link.connected ? TFT_GREEN : TFT_DARKGREY,
+                            TFT_BLACK);
+    M5.Display.setCursor(236, 10);
+    M5.Display.print(link.connected ? (link.authenticated ? "BT ok" : "BT ..")
+                                    : "BT adv");
+    M5.Display.setTextColor(TFT_WHITE, TFT_BLACK);
+  }
+  const auto wifi = lan::status();
+  if (std::strcmp(wifi.state, "off") != 0) {
+    const bool up = std::strcmp(wifi.state, "connected") == 0;
+    M5.Display.setTextColor(up ? TFT_GREEN : TFT_DARKGREY, TFT_BLACK);
+    M5.Display.setCursor(196, 10);
+    M5.Display.print(up ? (wifi.authenticated ? "WiFi ok" : "WiFi up")
+                        : "WiFi ..");
+    M5.Display.setTextColor(TFT_WHITE, TFT_BLACK);
+  }
 
   constexpr int bar_top = 31;
   constexpr int bar_height = 184;
@@ -630,24 +654,113 @@ void draw_device_page() {
                     static_cast<unsigned long>(kDisplayIntervalMs / 1000));
 }
 
+void draw_bluetooth_page() {
+  const auto link = ble::link();
+  const auto wifi = lan::status();
+  const auto settings = config::get();
+  M5.Display.setTextSize(1);
+  M5.Display.setCursor(8, 35);
+  M5.Display.print("Device name");
+  M5.Display.setTextSize(3);
+  M5.Display.setCursor(8, 48);
+  M5.Display.print(ble_started ? ble::local_name() : "BLE off");
+  M5.Display.setTextSize(1);
+  M5.Display.setCursor(8, 82);
+  if (!ble_started)
+    M5.Display.print("Bluetooth did not start; USB sync still works");
+  else if (link.connected)
+    M5.Display.printf("BT connected  %s  MTU %u",
+                      link.authenticated ? "paired" : "pairing...",
+                      static_cast<unsigned>(link.mtu));
+  else
+    M5.Display.print("BT advertising: open the AQ Sync app to pair");
+  M5.Display.setCursor(8, 96);
+  M5.Display.printf("Pairing: %s%s   bonded phones: %lu",
+                    config::pair_name(settings.pair),
+                    settings.pair == config::PairMode::Fixed &&
+                            settings.pin == config::kDefaultPin
+                        ? " (default PIN!)"
+                        : "",
+                    static_cast<unsigned long>(link.bonds));
+  if (config::reboot_required()) {
+    M5.Display.setTextColor(TFT_YELLOW, TFT_BLACK);
+    M5.Display.setCursor(8, 108);
+    M5.Display.print("Pairing change waits for a reboot");
+    M5.Display.setTextColor(TFT_WHITE, TFT_BLACK);
+  }
+  M5.Display.setCursor(8, 128);
+  if (!settings.wifi_on)
+    M5.Display.print("Wi-Fi: off (set up from the app)");
+  else if (std::strcmp(wifi.state, "connected") == 0)
+    M5.Display.printf("Wi-Fi: %s  %s  %d dBm", settings.ssid, wifi.ip,
+                      wifi.rssi);
+  else
+    M5.Display.printf("Wi-Fi: %s  %s", settings.ssid, wifi.state);
+  M5.Display.setCursor(8, 142);
+  if (settings.wifi_on && std::strcmp(wifi.state, "connected") == 0)
+    M5.Display.printf("LAN sync: %s.local:%u  %s  sessions %lu", wifi.host,
+                      static_cast<unsigned>(config::kLanPort),
+                      wifi.authenticated ? "phone connected"
+                                         : (wifi.mdns ? "waiting" : "no mDNS"),
+                      static_cast<unsigned long>(wifi.sessions));
+  else
+    M5.Display.print("LAN sync: needs Wi-Fi");
+  M5.Display.setCursor(8, 170);
+  M5.Display.print("Files are copied to the phone, never");
+  M5.Display.setCursor(8, 182);
+  M5.Display.print("deleted here. Works offline.");
+}
+
+// Pairing takes over the whole screen so the six digits are unmistakable.
+void draw_pairing_overlay(const ble::PairingState &pairing) {
+  M5.Display.fillScreen(TFT_BLACK);
+  M5.Display.setTextColor(TFT_WHITE, TFT_BLACK);
+  M5.Display.setTextSize(2);
+  M5.Display.setCursor(8, 20);
+  M5.Display.print("Pair with phone");
+  M5.Display.setTextSize(1);
+  M5.Display.setCursor(8, 50);
+  M5.Display.print("Enter this code on the phone:");
+  M5.Display.setTextSize(6);
+  M5.Display.setCursor(52, 90);
+  M5.Display.printf("%06lu", static_cast<unsigned long>(pairing.passkey));
+  M5.Display.setTextSize(1);
+  M5.Display.setCursor(8, 170);
+  M5.Display.printf("Device %s", ble::local_name());
+  M5.Display.setCursor(8, 190);
+  if (ble::pair_mode() == config::PairMode::Fixed)
+    M5.Display.print("Fixed PIN: change it from the app if it is 123456.");
+  else
+    M5.Display.print("Only someone reading this screen can pair.");
+}
+
 void show_pms_screen() {
   telemetry::lock_display();
   M5.Display.setRotation(1);
+  const auto pairing = ble::pairing();
+  if (ble_started && pairing.active) {
+    draw_pairing_overlay(pairing);
+    M5.Display.waitDMA();
+    telemetry::unlock_display();
+    return;
+  }
   M5.Display.fillScreen(TFT_BLACK);
   M5.Display.setTextColor(TFT_WHITE, TFT_BLACK);
 
   constexpr const char *titles[kScreenPageCount] = {
-      "PM mass", "Particle counts", "Device health"};
+      "PM mass", "Particle counts", "Device health", "Bluetooth"};
   draw_screen_header(titles[screen_page]);
 
-  if (!has_pms_frame && screen_page != 2) {
+  if (!has_pms_frame && screen_page < 2) {
     draw_waiting_for_pms();
   } else if (screen_page == 0) {
     draw_mass_page();
   } else if (screen_page == 1) {
     draw_counts_page();
-  } else {
+  } else if (screen_page == 2) {
     draw_device_page();
+  } else {
+    draw_bluetooth_page();
   }
   draw_screen_footer();
   M5.Display.waitDMA();
@@ -691,9 +804,9 @@ void handle_touch_navigation() {
 
   screen_page = next_page;
   show_pms_screen();
-  Serial.printf("UI page=%u/%u gesture=%s\n",
-                static_cast<unsigned>(screen_page + 1),
-                static_cast<unsigned>(kScreenPageCount), gesture);
+  aqlog.printf("UI page=%u/%u gesture=%s\n",
+               static_cast<unsigned>(screen_page + 1),
+               static_cast<unsigned>(kScreenPageCount), gesture);
 }
 
 } // namespace
@@ -714,7 +827,7 @@ void setup() {
   M5.begin(config);
   delay(500);
 
-  Serial.println("DIAG BEGIN schema=cores3-bringup-v1");
+  aqlog.println("DIAG BEGIN schema=cores3-bringup-v1");
   report_chip();
   report_memory();
   report_i2c();
@@ -723,9 +836,13 @@ void setup() {
   sd_mounted = report_sd();
   start_pms();
   telemetry::begin_logger(sd_mounted);
+  if (kEnableBle) {
+    ble_started = telemetry::start_links(M5.getDisplayCount() > 0);
+    last_ble_ui_generation = ble::ui_generation() + lan::ui_generation();
+  }
   show_pms_screen();
   last_display_ms = millis();
-  Serial.println("DIAG COMPLETE schema=cores3-bringup-v1");
+  aqlog.println("DIAG COMPLETE schema=cores3-bringup-v1");
 }
 
 void loop() {
@@ -752,6 +869,13 @@ void loop() {
   telemetry::poll_logger(sample);
   handle_touch_navigation();
   const std::uint32_t now = millis();
+  const std::uint32_t link_generation =
+      ble::ui_generation() + lan::ui_generation();
+  if (ble_started && link_generation != last_ble_ui_generation) {
+    last_ble_ui_generation = link_generation;
+    show_pms_screen();
+    last_display_ms = now;
+  }
   if (static_cast<std::uint32_t>(now - last_display_ms) >= kDisplayIntervalMs) {
     show_pms_screen();
     print_periodic_pms();

@@ -33,7 +33,8 @@ fi
 "${trial_dir}/arduino-cli.sh" core install "esp32:esp32@${ARDUINO_ESP32_VERSION}"
 "${trial_dir}/arduino-cli.sh" lib install "M5GFX@${M5GFX_VERSION}"
 "${trial_dir}/arduino-cli.sh" lib install "M5Unified@${M5UNIFIED_VERSION}"
+"${trial_dir}/arduino-cli.sh" lib install "NimBLE-Arduino@${NIMBLE_ARDUINO_VERSION}"
 
 "${trial_dir}/arduino-cli.sh" version
 "${trial_dir}/arduino-cli.sh" core list
-"${trial_dir}/arduino-cli.sh" lib list | sed -n '/^M5GFX[[:space:]]/p;/^M5Unified[[:space:]]/p'
+"${trial_dir}/arduino-cli.sh" lib list | sed -n '/^M5GFX[[:space:]]/p;/^M5Unified[[:space:]]/p;/^NimBLE-Arduino[[:space:]]/p'
