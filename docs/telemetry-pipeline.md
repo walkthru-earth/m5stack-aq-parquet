@@ -104,6 +104,8 @@ Record sample jitter, queue high-water mark, drops, internal and PSRAM minimum f
 
 ## Upload and cloud layout
 
+> **Implemented transport (2026-09-16):** finalized files can be pulled over Bluetooth LE by a paired phone or laptop, whole-file and verified — see the [BLE sync protocol](ble-sync-protocol.md). It is a pull of immutable files, not the acknowledged upload described below; nothing is deleted or marked on the card. Offline-first ordering: device → local archive (phone/laptop/hub) first, then optionally archive → cloud when the owner turns that on; a device or phone with Wi-Fi or a SIM may shortcut, but must not skip the local copy.
+
 The SD layout already uses the requested Hive partition directories, ready to preserve as object keys when upload is added. UTC-dated files use:
 
 ```text

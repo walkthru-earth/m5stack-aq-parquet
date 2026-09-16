@@ -1,6 +1,26 @@
 # Trial, Arduino-ESP32 with M5Unified
 
-**Status: active. Real-sensor Parquet SD logging, full 60/90-row uncompressed files, UTC Hive checks and identical-row LZ4 compression comparisons were verified on hardware on 2026-09-08.**
+**Status: active. Real-sensor Parquet SD logging, full 60/90-row uncompressed files, UTC Hive checks and identical-row LZ4 compression comparisons were verified on hardware on 2026-09-08. Bluetooth LE file sync (`arduino-cores3-parquet-v4`) was flashed and verified from a host BLE client on 2026-09-16.**
+
+## Work in progress (last verified 2026-09-17, resume here)
+
+`arduino-cores3-parquet-v5` — protocol **v2** ([contract](../../docs/ble-sync-protocol.md)): device configuration, pairing modes, Wi-Fi provisioning, LAN sync server. **On the board now**, binary SHA-256 `6144ea1d…`, retained at `artifacts/firmware/cores3-parquet-v5-6144ea1d.bin` (previous: `d5f1db40…`, same directory). 1,408,487 program bytes / 78,628 static RAM. The board is provisioned to the owner's home Wi-Fi (credentials live only in the board's NVS). Everything in the tree is uncommitted on purpose (owner's call); `pixi run fmt-check`, `pixi run lint` and `pixi run python tools/test_ble_sync.py` pass. Bench detail: [bench record](../../docs/bench-verified.md#board-1-protocol-v2-configuration-wi-fi-lan-sync-phone).
+
+| Piece | State |
+| --- | --- |
+| `bringup/device_config.{h,cpp}` — NVS `aqcfg` settings, `key=value` parser, CONFIG JSON, LAN token, Meshtastic-style first-boot pairing default (display → `random`, none → `fixed` 123456) | done; `GET_CONFIG`, `SET_CONFIG` validation (`code=12`) and `GET_TOKEN` **verified over BLE** |
+| `bringup/ble_sync.{h,cpp}` — v2 opcodes/frames, `Link` tag on requests, `random`/`fixed`/`none` pairing, `clear_bonds()`, **every BLE frame ≤ 512 bytes** (Android drops larger notifications), 4 s notify retry budget | done; only `random` (the CoreS3 default) has run on hardware; the 512 cap fixed the phone's deterministic BLE gap |
+| `bringup/debug_log.{h,cpp}` — `aqlog` serial tee with 8 KiB ring; every `Serial.print*` in the firmware goes through it | done; `LOG_TAIL` **verified over BLE** |
+| `bringup/wifi_link.{h,cpp}` — LAN task: STA state machine, `WIFI_SCAN`, mDNS `_aqsync._tcp`, TCP :47390 with `AQS1`+token handshake, STATUS/LIVE pushes, send failure drops the session, **token takeover** (a second connection with the valid token replaces a half-open session) | **verified on hardware** from the Mac (provisioning, rejoin after reflash/reboot, mDNS, handshake, auth refusal, LIST, 6- and 40-file syncs at 19–62 KB/s, REBOOT, takeover/wrong-token/silent challenger) and from the phone (all 776 files synced over LAN across three runs, 45–63 files/min); BLE+Wi-Fi jitter ≤ 17.7 ms, heap 82 KB free — see the bench record |
+| `bringup/telemetry_logger.cpp` — link-aware dispatch (`respond`/`respond_error`/`link_payload_max`), new ops incl. `REBOOT` (finalizes the batch first), worker heartbeat (stamped per frame) + stall report, worker stack 24 KiB | done; `REBOOT` verified over LAN; `ble.clear_bonds`, `lan.rotate_token` not yet exercised |
+| `bringup/bringup.ino` — page 4 shows pairing mode / default-PIN warning / Wi-Fi / LAN, header `WiFi ..|up|ok`, `start_links(display_detected)` | done, seen on the LCD |
+| `tools/ble_sync.py` — `config`, `set`, `wifi-scan`, `token --save`, `log`, `reboot`; `--lan HOST[:PORT] --token-file` runs every command over TCP | done; LAN path proven only against the scripted server in `tools/test_ble_sync.py` |
+| Docs | contract v2, bench record (BLE, Wi-Fi, LAN, phone), lessons, `cores3-wireless.md` (Wi-Fi in use), `cores3-development.md` (footprint, wedged-task recipe, `aqlog`), router rows — done |
+| Android v2 (`../m5stack-aq-android`) | commits `f16420e`…`2f4c994` (88 unit tests, lint clean) tested on a **OnePlus 7 Pro / Android 16**: BLE reconnect, automatic token fetch, LAN selection via NsdManager, `dataSync` foreground service with progress notification (survives screen-off), reconnect + resume, window-loss recovery, **Auto-sync** (WorkManager, LAN first, bonded BLE fallback, interactive-session guard proven in logcat), Reboot only via the Device-screen dialog. `2f4c994` (WifiLock, resume after transport failure, transport chip) is installed but not yet exercised |
+
+Next: one uninterrupted full-card run for a clean timing number, a scheduled auto-sync with the app closed, `ble.clear_bonds` / `lan.rotate_token` from the app, `fixed`/`none` pairing on a display-less board, then commit this repo (the Android repo is committed).
+
+**Flashed and bench-tested, 2026-09-16:** `arduino-cores3-parquet-v4` adds a NimBLE GATT server implementing [protocol v1](../../docs/ble-sync-protocol.md): device info, live/status JSON, UTC time set, finalized-file manifest and windowed file reads, all executed by the existing single storage worker. Build 842,743 program bytes / 39,372 static RAM bytes; binary SHA-256 `d1e5151fb3d3a33cb0f4dd65c51d7359df77cf40f740df2fb54173bc2289cc4b`, retained at `artifacts/firmware/cores3-parquet-v4-d1e5151f.bin`. Passkey pairing, 766-file listing, six verified file transfers (14.7–21.6 KB/s), `SET_TIME` and `FLUSH` were measured from macOS; see the [bench record](../../docs/bench-verified.md#board-1-bluetooth-le-sync). The USB-serial command protocol is unchanged. No phone has been tested against the board yet.
 
 This is the only active framework trial. It establishes the CoreS3 hardware baseline and tests whether a bounded C++ writer can produce interoperable Parquet from real ten-second measurements on microSD. It owns its toolchain bootstrap, exact dependency versions, board options, partition layout and build outputs. Networking and Iceberg are deferred.
 
@@ -16,6 +36,7 @@ See [the observation model and Mermaid workflows](../../docs/table-and-observati
 | Arduino-ESP32 | 3.3.11, based on ESP-IDF 5.5.5 |
 | M5Unified | 0.2.21 |
 | M5GFX | 0.2.28 |
+| NimBLE-Arduino | 2.5.1 (BLE host for the sync service) |
 | Vendored LZ4, BSD-2-Clause | 1.10.0, hashes in `dependencies.lock` |
 | Board FQBN | `esp32:esp32:m5stack_cores3` |
 
@@ -106,7 +127,10 @@ pixi run parquet-device capture --port /dev/cu.usbmodem101 --seconds 650 --until
 pixi run parquet-device fetch --port /dev/cu.usbmodem101 '<reported-relative-path>.parquet' --out firmware/arduino-m5unified/artifacts/output
 pixi run parquet-device bench --port /dev/cu.usbmodem101 --sync-time --seconds 960 --until-ready --out firmware/arduino-m5unified/artifacts/output --log firmware/arduino-m5unified/artifacts/hive-bench.log
 pixi run python tools/export_parquet.py --port /dev/cu.usbmodem101 --out firmware/arduino-m5unified/artifacts/exports/new-snapshot
+pixi run python tools/export_parquet.py --port /dev/cu.usbmodem101 --out exports/sd-$(date -u +%Y%m%dT%H%M%SZ)   # full-card keep-safe copy at the repo root (git-ignored)
 ```
+
+`export_parquet.py` is idempotent and resumable: each file is requested up to `--retries` times (default 3) because a `PARQUET ROW` log line can, rarely, corrupt one hex transfer line, and files already published in `--out` are re-validated instead of re-downloaded, so an interrupted export is finished by re-running the same command. The manifest records `live-device-readback` versus `resumed-local-verified` per file. The 2026-09-16 full-card copy (764 files, 66,987 rows) lives in root `exports/`, which is git-ignored on purpose: it is the owner's data, not repository evidence.
 
 Changing the interval first flushes any current rows; the setting lasts until reboot, when it returns to 900 seconds. UTC must be supplied again after reboot until a persistent trusted clock or network time source is implemented. `fetch` reads the **already-written SD file** in bounded chunks over USB, verifies length/CRC32, compares every stored value/null through PyArrow and DuckDB, and preserves Hive directories. There is no host-side format conversion. Keep evidence in git-ignored **`artifacts/`, never `build/`**: Arduino can clean its build directory. `bench` uses one serial connection; use a fresh log path, or omit `--log`. The export-all helper snapshots every listed finalized file, including the legacy prefix, without resetting/flushing/deleting; RAM-only pending rows are excluded.
 
@@ -149,8 +173,30 @@ Offline acquisition does not require internet, but uninterrupted power and funct
 
 The contract and later cloud design remain in [the telemetry pipeline](../../docs/telemetry-pipeline.md). A second framework trial requires a concrete limitation from this one, recorded here first.
 
+## Bluetooth LE sync
+
+The board advertises as `AQ-xxxx` (last four hex digits of the Wi-Fi MAC-derived `device_id`) with the 128-bit service UUID from [the contract](../../docs/ble-sync-protocol.md). Everything is encrypted and authenticated: the first connection from a new phone or laptop shows a random six-digit passkey full-screen on the LCD (also printed as `BLE PAIR passkey=…` on serial, deliberately, for bench logs). Only a person who can read the screen can pair. The link is one connection at a time; advertising resumes on disconnect. `kEnableBle` in `bringup.ino` switches the radio off at compile time.
+
+Implementation notes: `Command` now carries a source tag and, for BLE, a ≤ 512-byte raw request, so the struct grew to about 1 KB and the queue depth went 4 → 6 (≈ 6 KB heap). `list_directory` takes an emitter callback so LIST and the serial `PARQUET FILE` lines share one walk; `set_clock()` is shared by `parquet time` and `SET_TIME`. Worker state the phone needs (`failed`, storage readiness, retained partials, missed deadlines) is mirrored into atomics so the `status` document can be built from any task. `kFirmware` is `arduino-cores3-parquet-v4`; the dictionary and schema are unchanged.
+
+Ownership does not change: NimBLE callbacks only queue a request on the same command queue the serial parser feeds (`Command::Source::Ble`); the storage worker executes it and emits `response` notifications itself; `live`/`status` are published by the sampling loop right after the row is queued. Page 4 of the LCD shows the device name, link state and bond count. Serial lines added: `BLE BEGIN|CONNECT|MTU|PAIR|BONDED|DISCONNECT|CMD|OPEN|READ|ERROR|LIST SKIP`.
+
+Host client for bench and recovery without a phone (bleak, PyPI dependency in `pixi.toml`):
+
+```sh
+pixi run ble-sync scan
+pixi run ble-sync --name AQ-6b40 info
+pixi run ble-sync --name AQ-6b40 live --seconds 35
+pixi run ble-sync --name AQ-6b40 list
+pixi run ble-sync --name AQ-6b40 sync --out firmware/arduino-m5unified/artifacts/ble-<date>
+pixi run ble-sync --name AQ-6b40 time    # explicit UTC write, same rules as `parquet time`
+pixi run ble-sync --name AQ-6b40 flush   # explicit, finalizes the RAM batch
+```
+
+On macOS run these from Terminal.app: CoreBluetooth aborts clients launched from a process without a Bluetooth usage entitlement (measured). `sync` writes the same verified layout and `manifest.json` as `tools/export_parquet.py`, so BLE and USB exports are byte-comparable. `python tools/test_ble_sync.py` checks the host frame codec offline.
+
 ## Recovery
 
 The original 16 MB UIFlow image is preserved under `backup/`. `pixi run restore backup/<file>.bin` writes it back and is destructive, so name the image explicitly. Never write eFuses or raise the esptool baud on this board.
 
-**Last verified on hardware: 2026-09-08, board MAC ending `6b:40`.**
+**Last verified on hardware: 2026-09-16, board MAC ending `6b:40` (BLE sync, `arduino-cores3-parquet-v4`).**

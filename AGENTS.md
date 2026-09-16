@@ -34,6 +34,7 @@ Trial directory names state the framework first, for example `firmware/idf-cpp/`
 | Wiring, GPIO ownership, onboard peripherals, power, sleep, boot | `docs/cores3-hardware.md` |
 | Toolchain, framework choice, library versions, memory, driver ownership | `docs/cores3-development.md` |
 | Wi-Fi, BLE, ESP-NOW, channels, coexistence | `docs/cores3-wireless.md` |
+| Phone sync over BLE or LAN: GATT service, frame layout, pairing modes, device configuration, Wi-Fi/TCP/mDNS transport, token, file transfer rules | `docs/ble-sync-protocol.md` |
 | microSD, shared SPI bus, logging, power-loss recovery | `docs/cores3-storage.md` |
 | Measurement schema, Parquet, Hive partitions, clocks, future upload | `docs/telemetry-pipeline.md` |
 | Versioned dictionary, OGC semantics, static Iceberg and workflow diagrams | `docs/table-and-observation-model.md` |
@@ -77,7 +78,7 @@ Further rules.
 
 ## Reading the board back
 
-`pixi run capture --port <port> --seconds <n>` records serial output for a bounded time and stops, so a silent board cannot hang the caller. Add `--out <file>` to keep the log, or `--until "<text>"` to stop early. `pixi run monitor <port> <baud>` is the interactive terminal.
+For Bluetooth and LAN, `pixi run ble-sync …` (`tools/ble_sync.py`) is the host client for `docs/ble-sync-protocol.md`; on macOS launch it from Terminal.app. Only `time`, `flush`, `set` and `reboot` write to the device. `--lan aq-xxxx.local --token-file artifacts/lan-token.txt` runs the same commands over TCP once `token --save` has fetched the token over BLE; the token is a bearer secret and stays in git-ignored `artifacts/`, never in docs or logs. If a worker-side command goes unanswered while sampling continues, look for `PARQUET ERROR operation=worker-stall` on serial and decode any task-watchdog backtrace with `xtensa-esp-elf-addr2line -pfiaC -e firmware/arduino-m5unified/build/bringup.ino.elf <addresses>` (see `docs/bench-verified.md`). `pixi run capture --port <port> --seconds <n>` records serial output for a bounded time and stops, so a silent board cannot hang the caller. Add `--out <file>` to keep the log, or `--until "<text>"` to stop early. `pixi run monitor <port> <baud>` is the interactive terminal.
 
 If a capture returns nothing, the board is most likely sitting in the ROM download bootloader, which prints nothing at all. Confirm with `pixi run chip`, which still answers there.
 
@@ -88,6 +89,7 @@ During an active Parquet run, prefer `pixi run parquet-device capture --port <po
 - Preserve the 10-second monotonic sampling deadline, sensor validity/nulls and visible drop/error counters. Display refreshes are separate snapshots, not exact-value references for stored rows.
 - One storage worker owns filesystem access after startup; display and SD share an application mutex, with display DMA completed before unlock. Do not infer safe concurrent SPI access or measured speedup from the presence of two cores.
 - Keep station identity in NVS and the UTC Hive path contract. Unsynchronized time stays null and uses the `unsynced` tree; do not fabricate dates or silently rewrite previous rows after a clock update.
+- **Offline-first ordering.** The card is the origin, a local archive (phone, laptop, hub) is the first copy, the cloud is an optional later step that the owner turns on. Device↔phone links (BLE now; Wi-Fi or LoRa device-to-device later) are sync transports that must work with no internet; a device or phone that has Wi-Fi or a SIM may add a path, never replace the local copy. Do not design a feature that needs a server to show the owner their own data.
 - Finalized Parquet files are immutable. Retain `.partial` files; no automatic formatting, recovery, retention deletion or upload is implemented. RAM-only batching can lose the unfinished batch on reset, and a normal-reset readback does not prove power-cut durability.
 - Keep each measurement tied to its image/schema. The earlier 72-column/60-row and later 73-column/90-row uncompressed runs are separate evidence. A host fixture is not a hardware endurance test; Snappy/Zstd and radio/upload still need board measurements. LZ4 details and measured scope live in `docs/compression-benchmark.md`.
 
@@ -99,7 +101,7 @@ For writer/schema or readback changes, also run `pixi run parquet-test --sanitiz
 
 For the measurement contract, also run `pixi run telemetry-contract-test --sanitize`. `telemetry_fields.inc` is the single source for names/types/procedure/unit/validity; update its compiled SHA-256 intentionally when editing it. Do not invent deployment, calibration, sensor serials or UTC. Version schema changes explicitly; backward compatibility is not required, but existing saved files must not be deleted or rewritten without authorization. Mermaid diagrams should distinguish implemented work from planned services; metadata compatibility is not OGC API compliance.
 
-Keep **captures, exports, benchmark reports and retained firmware binaries in the trial's git-ignored `artifacts/` directory, outside `build/`**. Arduino cleaned `build/` during a changed-configuration rebuild and removed the first local exports/logs; SD files were retained and all finalized Parquet files were restored into `artifacts/`. Never treat a build cache as evidence storage. Record artifact identities/hashes in `docs/bench-verified.md`.
+Keep **captures, exports, benchmark reports and retained firmware binaries in the trial's git-ignored `artifacts/` directory, outside `build/`**. A full-card keep-safe copy of the owner's data may live in the root `exports/` directory (git-ignored); it is the owner's data, not repository evidence, so `docs/` cites file hashes rather than that directory. Arduino cleaned `build/` during a changed-configuration rebuild and removed the first local exports/logs; SD files were retained and all finalized Parquet files were restored into `artifacts/`. Never treat a build cache as evidence storage. Record artifact identities/hashes in `docs/bench-verified.md`.
 
 ## Hard rules
 

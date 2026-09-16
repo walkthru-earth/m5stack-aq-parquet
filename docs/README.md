@@ -12,6 +12,7 @@ Current result: the [active Arduino trial](../firmware/arduino-m5unified/README.
 | C/C++, framework choice, library versions, memory, driver ownership | [Development](cores3-development.md) |
 | Wi-Fi, Bluetooth LE, ESP-NOW, channels and coexistence | [Wireless](cores3-wireless.md) |
 | Built-in microSD slot, shared SPI, logging, removal/recovery | [Storage](cores3-storage.md) |
+| Phone sync over Bluetooth LE or LAN: GATT service, frames, pairing modes, device configuration, Wi-Fi/TCP/mDNS transport, file transfer contract | [Sync protocol](ble-sync-protocol.md) |
 | Sensor validity, station identity, clock epochs, Parquet, Hive and future ingestion | [Telemetry pipeline](telemetry-pipeline.md) |
 | Static Iceberg, SensorThings V2 draft, observation mapping and versioned provenance | [Table and observation model](table-and-observation-model.md) |
 | Build/flash, runtime interval/time commands, USB fetch and query examples | [Active trial usage](../firmware/arduino-m5unified/README.md) |

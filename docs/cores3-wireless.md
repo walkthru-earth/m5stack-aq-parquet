@@ -1,9 +1,9 @@
 # CoreS3 wireless: constraints and tuning
 
-Load for Wi-Fi/BLE/ESP-NOW design or debugging. Source-checked 2026-09-06; implementation scope updated 2026-09-08; target **ESP32-S3**. No radio workload has been bench-verified in this project.
+Load for Wi-Fi/BLE/ESP-NOW design or debugging. Source-checked 2026-09-06; implementation scope updated 2026-09-17; target **ESP32-S3**. Only short BLE sync sessions and one Wi-Fi scan have been bench-verified in this project; no Wi-Fi association or coexistence load has.
 SDK/library pins: [development](cores3-development.md). Linked `stable` guides currently describe IDF 6.1; select the installed SDK version before copying APIs/Kconfig.
 
-The current trial logs Parquet to SD without Wi-Fi, BLE, ESP-NOW, NTP or object-storage upload. Its UTC comes from an explicit USB host command, not a network clock. Separate acquisition/storage tasks and available internal heap do not establish headroom under TLS/radio traffic or a dual-core speedup. When upload is added, preserve immutable file identities, read SD in bounded chunks, release the display/SD mutex before network waits, and remeasure jitter, drops and memory under reconnect/coexistence load. The acknowledgement/retention design is still planned in the [telemetry pipeline](telemetry-pipeline.md#upload-and-cloud-layout).
+The current trial logs Parquet to SD without ESP-NOW, NTP or object-storage upload; since 2026-09-16 it runs a BLE GATT sync service ([contract](ble-sync-protocol.md), [measurements](bench-verified.md#board-1-bluetooth-le-sync)) and since protocol v2 an optional Wi-Fi station with a LAN sync server ([below](#wi-fi-station-and-lan-sync-in-the-arduino-trial)). Its UTC comes from an explicit USB host or phone command, not a network clock. Separate acquisition/storage tasks and available internal heap do not establish headroom under TLS/radio traffic or a dual-core speedup. When upload is added, preserve immutable file identities, read SD in bounded chunks, release the display/SD mutex before network waits, and remeasure jitter, drops and memory under reconnect/coexistence load. The acknowledgement/retention design is still planned in the [telemetry pipeline](telemetry-pipeline.md#upload-and-cloud-layout).
 
 ## Radio and channel model
 
@@ -26,6 +26,16 @@ The LZ4 SD benchmark establishes local feasibility and smaller payloads, not net
 - Match callback typedefs to installed headers: these snapshots use `const esp_now_send_info_t *` for send information; old MAC-pointer callback examples need migration. Copy received bytes/metadata before callback return. [Headers][now55]
 - Send success acknowledges the MAC layer only: application sequence IDs, acknowledgement, retry/backoff and deduplication handle loss. Queue callback work; pace sends using completion rather than flooding the driver. [ESP-NOW][now]
 - Mixed legacy nodes: keep payloads ≤250 bytes unless every receiver supports v2's 1470-byte payload. Explicit PMK/LMK and encrypted unicast protect peers; multicast encryption is unsupported. Read actual target limits/Kconfig instead of assuming a universal encrypted-peer count. [ESP-NOW][now]
+
+## Wi-Fi station and LAN sync in the Arduino trial
+
+Source-checked 2026-09-17 against `firmware/arduino-m5unified/bringup/wifi_link.cpp` (protocol v2, [contract](ble-sync-protocol.md#lan-transport-v2)). Measured scope (2026-09-17): scan, STA join and rejoin, mDNS, TCP sync from a Mac and an Android phone, session takeover, BLE+Wi-Fi coexistence cost; see [bench-verified](bench-verified.md#board-1-protocol-v2-configuration-wi-fi-lan-sync-phone).
+
+- **Off by default.** The STA radio comes up at runtime only when `wifi.on=1` and an SSID are stored in NVS (`aqcfg`, via `SET_CONFIG`); otherwise it stays `WIFI_OFF` and `GET_CONFIG` reports an all-zero MAC. Start sequence: `WiFi.persistent(false)` (NVS holds the credentials, not the driver), `WiFi.mode(WIFI_STA)`, `WiFi.setSleep(true)` (modem sleep, deliberately kept **on** for BLE coexistence), `WiFi.setAutoReconnect(false)`, then `WiFi.begin(ssid, psk)`. [Arduino WiFi API][arduino-wifi], [WiFi library 3.3.11][arduino-wifi-src]
+- **Own reconnect state machine** on the `aq-lan` task (100 ms tick), not the driver's auto-reconnect: 30 s connect timeout → `failed`, 30 s retry while `wifi.on`; a lost link stops the server and reconnects immediately. Serial/`LOG_TAIL` lines: `WIFI CONNECT ssid=`, `WIFI CONNECTED ssid= ip= rssi=`, `WIFI LOST`, `WIFI FAILED ssid= status= retry_s=`, `WIFI OFF reason=`. `wifi.state` in `CONFIG` mirrors these.
+- **mDNS** via ESPmDNS once connected and `lan.on`: `MDNS.begin(aq-xxxx)`, `addService("aqsync","tcp",47390)`, TXT `proto`, `station`, `dev`, `fw`; torn down with `MDNS.end()` when the link drops. `LAN LISTEN port= host=aq-xxxx.local mdns= service=_aqsync._tcp` confirms it. [ESPmDNS 3.3.11][espmdns], [ESP-IDF mDNS component][idf-mdns]
+- **Scans** (`WIFI_SCAN`) run on the LAN task, never the storage worker; when the radio is off it is brought up as `WIFI_STA` for the scan and returned to `WIFI_OFF` afterwards. `WiFi.scanNetworks()` is blocking (2–4 s per the contract; the bench run found 7 APs but did not time it), then `scanDelete()`; hidden SSIDs skipped, duplicates collapsed to strongest RSSI, ≤ 48 entries.
+- **BLE and Wi-Fi run together.** NimBLE keeps advertising/serving while the STA is up. Coexistence is **source-expected only**: the pinned Arduino core's prebuilt config has `CONFIG_ESP_COEX_SW_COEXIST_ENABLE 1` (`esp32s3-libs/3.3.11/qio_qspi/include/sdkconfig.h`, [prebuilt libs][arduino-libs]) and pins the BT controller, NimBLE host **and** the Wi-Fi task all to core 0 (`CONFIG_BT_CTRL_PINNED_TO_CORE 0`, `CONFIG_BT_NIMBLE_PINNED_TO_CORE 0`, `CONFIG_ESP_WIFI_TASK_PINNED_TO_CORE_0 1`), so the core split suggested below is not what the packaged core ships. Its effect on sampling jitter, notification drops and internal heap with STA + mDNS + TCP active is **not measured**; the v4 jitter/drop numbers were taken with Wi-Fi off. Record the first coexistence run in [bench-verified](bench-verified.md#still-unverified-on-hardware) before relying on it.
 
 ## BLE coexistence and scheduling
 
@@ -53,6 +63,11 @@ The LZ4 SD benchmark establishes local feasibility and smaller payloads, not net
 | OTA | [HTTPS OTA, partial download/resumption, signed images][ota]; `ota_0/ota_1`, rollback, post-boot health confirmation; power-cut and invalid-certificate/image tests. |
 | Provisioning / mesh / sensing | SDK keywords only: `wifi_provisioning`, `protocomm`, `wifi/roaming`, `esp_netif`, MQTT outbox, BLE Mesh, ESP-WIFI-MESH, CSI. Confirm S3 support and dependency versions before adopting. |
 
+[arduino-wifi]: https://docs.espressif.com/projects/arduino-esp32/en/latest/api/wifi.html
+[arduino-wifi-src]: https://github.com/espressif/arduino-esp32/tree/3.3.11/libraries/WiFi/src
+[espmdns]: https://github.com/espressif/arduino-esp32/tree/3.3.11/libraries/ESPmDNS
+[idf-mdns]: https://docs.espressif.com/projects/esp-protocols/mdns/docs/latest/en/index.html
+[arduino-libs]: https://github.com/espressif/esp32-arduino-libs
 [soc]: https://www.espressif.com/en/products/socs/esp32-s3
 [bt-architecture]: https://docs.espressif.com/projects/esp-idf/en/stable/esp32s3/api-guides/bt-architecture/overview.html
 [bt]: https://docs.espressif.com/projects/esp-idf/en/stable/esp32s3/api-reference/bluetooth/index.html
