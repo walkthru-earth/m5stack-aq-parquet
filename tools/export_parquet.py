@@ -14,10 +14,34 @@ import time
 import parquet_device as device
 
 
+def fetch_with_retry(port, name: str, expected_bytes: int, retries: int) -> bytes:
+    """One `parquet get` per attempt. The board's own PARQUET ROW log lines share
+    the serial link with the hex transfer, and a rare corrupted or truncated line
+    fails the strict parser; the transfer is idempotent, so simply ask again."""
+    failure = None
+    for attempt in range(1, retries + 1):
+        device.send_command(port, "parquet get " + name)
+        try:
+            payload = device.receive_file(device.lines_until(port, time.monotonic() + 60), name)
+        except (ValueError, TimeoutError) as error:
+            failure = error
+            print(f"RETRY attempt={attempt} name={name} reason={error}", flush=True)
+            # Let the device finish emitting the failed transfer before re-requesting.
+            for _ in device.lines_until(port, time.monotonic() + 2):
+                pass
+            continue
+        if len(payload) != expected_bytes:
+            raise ValueError("inventory size mismatch: " + name)
+        return payload
+    raise RuntimeError(f"transfer failed after {retries} attempts: {name}: {failure}")
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--port", required=True)
     parser.add_argument("--out", type=Path, required=True)
+    parser.add_argument("--retries", type=int, default=3,
+                        help="per-file transfer attempts before the export fails (default 3)")
     args = parser.parse_args()
     if "build" in args.out.parts:
         parser.error("use artifacts/, not a build directory that Arduino may clean")
@@ -46,13 +70,18 @@ def main():
             if not missing:
                 break
             for name in missing:
-                device.send_command(port, "parquet get " + name)
-                payload = device.receive_file(device.lines_until(port, time.monotonic() + 60), name)
-                if len(payload) != listed[name]:
-                    raise ValueError("inventory size mismatch: " + name)
                 relative = name if name.startswith("legacy-parquet/") else "output/" + name
+                existing = args.out / relative
+                if existing.is_file() and not existing.is_symlink() and existing.stat().st_size == listed[name]:
+                    # Resume: a previous interrupted run already published this file.
+                    # save_verified re-validates the bytes and refuses a differing copy.
+                    payload = existing.read_bytes()
+                    source = "resumed-local-verified"
+                else:
+                    payload = fetch_with_retry(port, name, listed[name], args.retries)
+                    source = "live-device-readback"
                 summary = device.save_verified(payload, relative, args.out)
-                records[name] = {"path": relative, "source": "live-device-readback",
+                records[name] = {"path": relative, "source": source,
                                  "bytes": len(payload), "rows": summary["rows"],
                                  "crc32": summary["crc32"],
                                  "sha256": hashlib.sha256(payload).hexdigest(),
