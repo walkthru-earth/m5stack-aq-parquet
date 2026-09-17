@@ -55,7 +55,7 @@ Base UUID `c0a5e9f0-XXXX-4b1a-9c3e-2d7f8a6b4e01`; the 16-bit field selects the a
 ### `info` (read)
 
 ```json
-{"proto":2,"fw":"cores3-parquet-v5","schema":"cores3-telemetry-v2","cols":77,
+{"proto":2,"fw":"cores3-parquet-v6","schema":"cores3-telemetry-v3","cols":77,
  "dict":"<64 hex, SHA-256 of telemetry_fields.inc>","station":"<uuid>",
  "dev":"<12 hex device_id>","boot":"<32 hex boot id>","max_read":16384}
 ```
@@ -69,14 +69,15 @@ Notified after every stored sample (every 10 s) and after any `control` request 
 ```json
 {"up_s":12345,"int_s":900,"buf":12,"fin":764,"drop":0,"err":0,"miss":0,
  "fail":0,"codec":"LZ4_RAW","utc":1,"gen":1,"sd":1,"sd_kib":31166976,
- "sd_used_kib":34176,"heap":180000,"part":0}
+ "sd_used_kib":34176,"heap":180000,"part":0,"open":180,"open_rg":2}
 ```
 
 | Key | Meaning |
 | --- | --- |
 | `up_s` | seconds since boot |
-| `int_s` | rotation interval (600 or 900) |
+| `int_s` | rotation interval in seconds (600 or 900; firmware v6 adds 1800 and 3600, set over serial only) |
 | `buf` | rows buffered in RAM, not yet in any file |
+| `open` / `open_rg` | firmware v6: rows and row groups already written and synced into the open `.partial` file whose footer is still pending; they become listable after the window closes or a `FLUSH`. Absent on v5 |
 | `fin` / `drop` / `err` / `miss` | same counters as `PARQUET STATUS` and the row fields `files_finalized`, `rows_dropped`, `storage_errors`, `sample_deadlines_missed` |
 | `fail` | 1 when the storage worker has stopped writing after an error |
 | `utc` / `gen` | 1 when a UTC anchor is set; anchor generation (`clock_epoch`) |
@@ -160,7 +161,7 @@ Rules:
 - **`READ`** is clipped to `max_read` and to end-of-file. Chunks are delivered in offset order; `next_offset` tells the phone where to continue. Offsets are absolute, so a phone can resume after a disconnect by `OPEN` + `READ` from where it stopped, provided `size` and `crc32` in the new `OPENED` frame match the earlier one (the file is immutable, so they must).
 - A file is **complete** only when the phone has `size` bytes, its own CRC-32 equals `OPENED.crc32`, and the head/tail magic is `PAR1`. Anything else is discarded, never presented as data.
 - `SET_TIME` uses the device's monotonic clock at the moment the write arrived, the same way `parquet time` does. Only rows sampled afterwards get UTC; earlier rows stay in the `unsynced` tree by contract. The phone should send its own clock only when it believes it is correct, and should say so in its UI.
-- `FLUSH` finalizes the RAM batch so the phone can pull everything up to now. Use it deliberately (a "sync now" action); it produces a short file and does not change the rotation interval.
+- `FLUSH` finalizes the RAM batch — and, on firmware v6, any row groups already in the open file — so the phone can pull everything up to now. Use it deliberately (a "sync now" action); it produces a short file and does not change the rotation interval. The `FLUSHED` row count is RAM rows plus rows that were already on the card in the open file.
 
 ## Device configuration (v2)
 

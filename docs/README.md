@@ -4,7 +4,7 @@ Target: **M5Stack CoreS3 / ESP32-S3**, C and/or C++. Accessories are optional, s
 
 Entry point: root [`AGENTS.md`](../AGENTS.md). It routes here and holds the host-environment and hard rules.
 
-Current result: the [active Arduino trial](../firmware/arduino-m5unified/README.md) writes real 10-second scalar snapshots directly to SD, with configurable 10/15-minute batching, UTC Hive partitions and optional LZ4_RAW compression. The [bench record](bench-verified.md#board-1-on-device-parquet-and-hive-partitions) separates the 60/90-row uncompressed runs and Hive/restart checks from codec testing. RAM-batch recovery, radio/upload and Iceberg remain open; this is not a production durability claim. Evidence belongs in git-ignored `artifacts/`, outside the disposable `build/` directory.
+Current result: the [active Arduino trial](../firmware/arduino-m5unified/README.md) writes real 10-second scalar snapshots directly to SD, with configurable 10/15/30/60-minute files (one 90-row row group per completed batch, per-column statistics, TIMESTAMP-annotated UTC since firmware v6), UTC Hive partitions and optional LZ4_RAW compression. The [bench record](bench-verified.md#board-1-on-device-parquet-and-hive-partitions) separates the 60/90-row uncompressed runs and Hive/restart checks from codec testing. RAM-batch recovery, radio/upload and Iceberg remain open; this is not a production durability claim. Evidence belongs in git-ignored `artifacts/`, outside the disposable `build/` directory.
 
 | When working on… | Read |
 | --- | --- |
