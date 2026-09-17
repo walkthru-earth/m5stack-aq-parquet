@@ -102,8 +102,10 @@ struct Result {
 //   writer.finish(metadata, metadata_count, build);
 //
 // The column array must stay valid and unchanged (names/types/annotation)
-// until finish(). After any failure the writer is inert; the caller owns
-// close/sync/rename and recovery. This finalizes file contents only.
+// until finish(). The Compression struct is copied by begin(); only the
+// buffers and codec state it points to must outlive the file. After any
+// failure the writer is inert; the caller owns close/sync/rename and
+// recovery. This finalizes file contents only.
 class Writer {
 public:
   Result begin(Sink sink, void *context, Workspace &workspace,
@@ -126,7 +128,8 @@ private:
   Workspace *workspace_ = nullptr;
   const Column *columns_ = nullptr;
   size_t column_count_ = 0;
-  const Compression *compression_ = nullptr;
+  bool compressed_ = false;
+  Compression compression_{}; // copy: the caller's struct may be a temporary
   size_t groups_ = 0;
   size_t used_ = 0; // bytes staged in workspace_->buffer
   uint64_t rows_ = 0;

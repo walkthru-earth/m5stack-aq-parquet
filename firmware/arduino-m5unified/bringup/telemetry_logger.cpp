@@ -367,7 +367,9 @@ bool create_file(OutputFile &target, Codec codec, bool benchmark) {
     return false;
   }
   std::setvbuf(target.file, target.staging, _IOFBF, 4096);
-  auto compression = writer_state->lz4.configuration();
+  // The writer copies this configuration; the LZ4 buffers/state it points to
+  // live in writer_state for the whole session.
+  const auto compression = writer_state->lz4.configuration();
   const auto result = target.writer.begin(
       sink, target.file, target.workspace, writer_state->columns, field_count,
       codec == Codec::Lz4Raw ? &compression : nullptr);
@@ -393,8 +395,6 @@ bool sync_file(OutputFile &target) {
 // Appends the RAM batch as one row group and makes it durable.
 bool append_group(OutputFile &target, std::size_t count) {
   writer_state->lz4.codec_us = 0;
-  // The compression configuration passed to begin() points at the shared
-  // LZ4 workspace, which is only touched inside row_group().
   const auto started = esp_timer_get_time();
   const auto result = target.writer.row_group(count, sequence);
   const auto elapsed = esp_timer_get_time() - started;

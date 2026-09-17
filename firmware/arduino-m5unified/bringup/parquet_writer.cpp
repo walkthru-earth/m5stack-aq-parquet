@@ -528,7 +528,9 @@ Result Writer::begin(Sink sink, void *context, Workspace &workspace,
   workspace_ = &workspace;
   columns_ = columns;
   column_count_ = column_count;
-  compression_ = compression;
+  compressed_ = compression != nullptr;
+  if (compressed_)
+    compression_ = *compression;
   active_ = true;
   // The magic stays in the staging buffer until the first page or the footer
   // flushes it, so a rejected first row group leaves the sink untouched.
@@ -550,8 +552,8 @@ Result Writer::row_group(size_t row_count, int sorted_by) {
         (column.valid &&
          (!column.valid_stride || column.valid_stride > SIZE_MAX / row_count)))
       return fail("invalid column buffer or stride");
-    if (compression_ &&
-        payload_size(column, row_count) > compression_->raw_capacity)
+    if (compressed_ &&
+        payload_size(column, row_count) > compression_.raw_capacity)
       return fail("compression page capacity exceeded");
   }
   Output out(sink_, context_, *workspace_, used_, position_, accepted_);
@@ -562,7 +564,8 @@ Result Writer::row_group(size_t row_count, int sorted_by) {
     ChunkRecord &record = chunks[i];
     statistics(columns_[i], row_count, record);
     record.offset = out.position();
-    if (!page(out, columns_[i], row_count, *workspace_, compression_, record))
+    if (!page(out, columns_[i], row_count, *workspace_,
+              compressed_ ? &compression_ : nullptr, record))
       return fail("page encoding/compression or sink failed");
     record.size = out.position() - record.offset;
     group.compressed_size += record.size;
@@ -591,8 +594,8 @@ Result Writer::finish(const KeyValue *metadata, size_t metadata_count,
   Output out(sink_, context_, *workspace_, used_, position_, accepted_);
   const uint64_t footer_start = out.position();
   footer(out, columns_, column_count_, *workspace_, groups_, rows_, metadata,
-         metadata_count,
-         compression_ ? compression_->codec : Codec::Uncompressed, build);
+         metadata_count, compressed_ ? compression_.codec : Codec::Uncompressed,
+         build);
   out.little_endian(out.position() - footer_start, 4);
   out.bytes("PAR1", 4);
   out.flush();

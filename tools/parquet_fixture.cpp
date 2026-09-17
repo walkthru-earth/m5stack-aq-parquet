@@ -144,8 +144,16 @@ int main(int argc, char **argv) {
   if (!file)
     return 3;
   telemetry::Writer writer;
-  auto result = writer.begin(file_sink, file, workspace, columns.data(),
-                             column_count, compressed ? &compression : nullptr);
+  telemetry::Result result;
+  {
+    // The firmware builds this struct on the stack of the function that
+    // opens the file; row groups are written minutes later. The writer must
+    // therefore copy it: clobber the caller's copy right after begin().
+    telemetry::Compression temporary = compression;
+    result = writer.begin(file_sink, file, workspace, columns.data(),
+                          column_count, compressed ? &temporary : nullptr);
+    memset(&temporary, 0xA5, sizeof(temporary));
+  }
   for (size_t g = 0; g < groups && result.ok && count; ++g) {
     fill(rows, count, g * count);
     result = writer.row_group(count, 0); // time_ms ascends within a group
