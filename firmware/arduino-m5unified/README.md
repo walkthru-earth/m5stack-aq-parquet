@@ -218,4 +218,4 @@ On macOS run these from Terminal.app: CoreBluetooth aborts clients launched from
 
 The original 16 MB UIFlow image is preserved under `backup/`. `pixi run restore backup/<file>.bin` writes it back and is destructive, so name the image explicitly. Never write eFuses or raise the esptool baud on this board.
 
-**Last verified on hardware: 2026-09-16, board MAC ending `6b:40` (BLE sync, `arduino-cores3-parquet-v4`).**
+**Last verified on hardware: 2026-09-17, board MAC ending `6b:40` (`arduino-cores3-parquet-v6`: two-row-group schema-v3 files at 1800 s, phone LAN pull; `-v5` LAN/Wi-Fi sync the same day).**

@@ -112,7 +112,7 @@ The SD layout already uses the requested Hive partition directories, ready to pr
 output/station=<UUID>/year=YYYY/month=MM/day=DD/data_HHMM_<boot>_<first>-<last>-<attempt>.parquet
 ```
 
-`HHMM` identifies the start of the UTC-aligned 10- or 15-minute window, not the upload time. The boot, sequence-range and attempt suffix prevents distinct files in the same window from overwriting each other after reboot, manual flush or a clock correction. The extension remains `.parquet`; the interval is configuration, not an extension suffix. New windows, midnight and clock-epoch changes split batches. Startup mid-window produces a short first file. Firmware paths include the `/sd` mount prefix; the card/object path starts at `output/`.
+`HHMM` identifies the start of the UTC-aligned 10-, 15-, 30- or 60-minute window, not the upload time. The boot, sequence-range and attempt suffix prevents distinct files in the same window from overwriting each other after reboot, manual flush or a clock correction. The extension remains `.parquet`; the interval is configuration, not an extension suffix. New windows, midnight and clock-epoch changes split batches. Startup mid-window produces a short first file. Firmware paths include the `/sd` mount prefix; the card/object path starts at `output/`.
 
 The worker detects window/epoch changes on arrival of the next sample; there is no independent wall-clock finalization alarm. A `READY` line proves that one file finalized, not that a full configured window was collected. In particular, `bench --sync-time --until-ready` may retrieve the old unsynced or shortened batch closed by the new anchor. Check row count, sequence range and timestamps before labeling a run a full 10/15-minute test.
 
@@ -122,7 +122,7 @@ For the later HTTPS uploader, create-only semantics such as `If-None-Match: *` m
 
 MQTT QoS 1 can carry live gauges, alarms and device health. It is not the durable measurement source because duplicates and reconnect gaps are normal. Deduplicate any live copy by the same row identity.
 
-The ingestion service can accept the device's finalized Parquet directly. Uninterrupted ten-/fifteen-minute rotation produces 144/96 files per station per UTC day; extra splits produce more. Cloud compaction can follow as fleet size and query costs warrant. Apache Iceberg catalog and snapshot management remain later work.
+The ingestion service can accept the device's finalized Parquet directly. Uninterrupted 10/15/30/60-minute rotation produces 144/96/48/24 files per station per UTC day (the longer windows hold 2 or 4 row groups each); extra splits produce more. Cloud compaction can follow as fleet size and query costs warrant. Apache Iceberg catalog and snapshot management remain later work.
 
 For later deployment, OpenTelemetry belongs at the gateway and ingestion services. The current device emits acquisition/storage counters, heap/queue health and a startup reset report. The new source adds an acquisition configuration identifier and dictionary digest; actual calibration/deployment history, RSSI and upload success remain future work. Translate device health into cloud metrics, logs and traces when networking is added.
 
