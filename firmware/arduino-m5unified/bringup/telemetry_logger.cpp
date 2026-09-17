@@ -41,12 +41,39 @@ using namespace contract;
 constexpr std::size_t kMaxRows = 90;
 constexpr std::int64_t kSampleUs = 10000000;
 constexpr const char *kDirectory = "/sd/output";
+// One Parquet file in progress: created as `.partial`, grown by one row group
+// per completed RAM batch (each fsynced), finalized with the footer at the
+// window boundary, at kMaxRowGroups, or on an explicit flush. Rows already in
+// a row group are on the card; only the RAM batch is lost on reset.
+struct OutputFile {
+  FILE *file = nullptr;
+  Writer writer;
+  Workspace workspace{};
+  char stem[384]{}; // <partition>/<prefix>_<boot>_<first>
+  char partial[416]{};
+  char *staging = nullptr; // internal-RAM stdio buffer
+  bool benchmark = false;
+  bool dated = false; // false: unsynced tree
+  Codec codec = Codec::Uncompressed;
+  std::int32_t epoch = 0;
+  std::int64_t window = 0; // UTC seconds / rotation, when dated
+  std::int64_t first = 0, last = 0;
+  std::uint32_t rows = 0;
+  std::uint32_t attempt = 0;
+  std::int64_t opened_us = 0;
+  std::uint64_t writer_us = 0, codec_us = 0, sync_us = 0;
+  bool open() const { return file != nullptr; }
+};
 struct WriterState {
   Sample rows[kMaxRows];
   Column columns[field_count];
-  Workspace workspace{};
+  OutputFile telemetry;
+  OutputFile benchmark; // codec-test copies never touch the telemetry file
   Lz4Workspace lz4{};
 };
+// stdio staging stays in internal RAM, distinct from the PSRAM row buffer.
+char staging_telemetry[4096];
+char staging_benchmark[4096];
 struct Command {
   enum class Source : std::uint8_t { Serial, Control };
   Source source = Source::Serial;
@@ -65,6 +92,8 @@ std::atomic<std::uint32_t> total_kib{0}, used_kib{0}, rotation_seconds{900};
 // Worker state mirrored for the BLE `status` document, which any task may
 // build.
 std::atomic<std::uint32_t> partials_seen{0};
+// Rows/row groups already on the card in the open .partial (footer pending).
+std::atomic<std::uint32_t> open_rows{0}, open_groups{0};
 std::atomic<bool> worker_failed{false}, storage_ok{false};
 std::int64_t boot_hi = 0, boot_lo = 0, device = 0, next_sample_us = 0;
 std::int64_t sample_sequence = 0;
@@ -224,17 +253,59 @@ bool make_directories(const char *path) {
   }
 }
 
-bool write_batch(std::size_t count, bool benchmark = false,
-                 Codec codec = Codec::Uncompressed) {
+// Rows per row group and row groups per file for the current rotation window.
+// 600 s -> 60-row groups, one per file; 900 s -> 90 x 1; 1800 s -> 90 x 2;
+// 3600 s -> 90 x 4. The RAM batch (loss window) never exceeds kMaxRows.
+std::size_t rows_per_group() {
+  const std::size_t rows = rotation_seconds.load() / 10;
+  return rows < kMaxRows ? rows : kMaxRows;
+}
+std::size_t groups_per_file() {
+  const std::size_t groups = rotation_seconds.load() / 900;
+  return groups ? (groups < kMaxRowGroups ? groups : kMaxRowGroups) : 1;
+}
+
+std::int64_t window_index(const Sample &row) {
+  return row.data[event_time_utc_ns] / 1000000000 /
+         static_cast<std::int64_t>(rotation_seconds.load());
+}
+
+// Whether `row` may join the file/batch that `reference` started: same clock
+// epoch, and the same UTC window when dated (never across midnight or a
+// clock correction).
+bool same_window(const Sample &row, std::int32_t epoch, bool dated,
+                 std::int64_t window) {
+  if (row.data[clock_epoch] != epoch)
+    return false;
+  const bool row_dated = row.valid[event_time_utc_ns] != 0;
+  if (row_dated != dated)
+    return false;
+  return !dated || window_index(row) == window;
+}
+
+void close_failed(OutputFile &target, const char *operation,
+                  const char *reason) {
+  ++errors;
+  aqlog.printf("PARQUET ERROR operation=%s file=%s reason=%s errno=%d "
+               "rows_on_card=%lu\n",
+               operation, target.stem, reason ? reason : "io-or-validation",
+               errno, static_cast<unsigned long>(target.rows));
+  if (target.file) {
+    BusLock lock;
+    std::fclose(target.file); // the .partial is retained, never repaired
+  }
+  target.file = nullptr;
+  if (!target.benchmark)
+    open_rows = open_groups = 0;
+}
+
+// Creates `<partition>/<prefix>_<boot>_<first>-<attempt>.partial` from the
+// first buffered row and starts the writer.
+bool create_file(OutputFile &target, Codec codec, bool benchmark) {
   static std::uint32_t attempt = 0;
-  if (!count)
-    return true;
-  if (!benchmark)
-    codec = selected_codec;
-  const auto first = writer_state->rows[0].data[sequence];
-  const auto last = writer_state->rows[count - 1].data[sequence];
-  char partition[160], prefix[24];
   const Sample &first_row = writer_state->rows[0];
+  char partition[160], prefix[24];
+  target.dated = false;
   if (benchmark) {
     std::snprintf(partition, sizeof(partition), "benchmarks/boot=%s",
                   boot_text);
@@ -253,54 +324,122 @@ bool write_batch(std::size_t count, bool benchmark = false,
                   utc.tm_year + 1900, utc.tm_mon + 1, utc.tm_mday);
     std::snprintf(prefix, sizeof(prefix), "data_%02d%02d", utc.tm_hour,
                   utc.tm_min);
+    target.dated = true;
+    target.window = window_index(first_row);
   } else {
     std::snprintf(partition, sizeof(partition), "station=%s/unsynced/boot=%s",
                   station_text, boot_text);
     std::strcpy(prefix, "data_unsynced");
   }
-  char name[384], path[416], ready[416], directory[192];
+  char directory[192];
   std::snprintf(directory, sizeof(directory), "%s/%s", kDirectory, partition);
   if (!make_directories(directory)) {
     ++errors;
     aqlog.println("PARQUET ERROR operation=mkdir");
     return false;
   }
-  std::snprintf(name, sizeof(name), "%s/%s_%s_%lld-%lld-%lu", partition, prefix,
-                boot_text, static_cast<long long>(first),
-                static_cast<long long>(last),
-                static_cast<unsigned long>(attempt++));
-  std::snprintf(path, sizeof(path), "%s/%s.partial", kDirectory, name);
-  std::snprintf(ready, sizeof(ready), "%s/%s.parquet", kDirectory, name);
-  const auto started = esp_timer_get_time();
-  FILE *file = nullptr;
+  target.benchmark = benchmark;
+  target.codec = codec;
+  target.epoch = static_cast<std::int32_t>(first_row.data[clock_epoch]);
+  target.first = target.last = first_row.data[sequence];
+  target.rows = 0;
+  target.writer_us = target.codec_us = target.sync_us = 0;
+  target.attempt = attempt++;
+  target.opened_us = esp_timer_get_time();
+  std::snprintf(target.stem, sizeof(target.stem), "%s/%s_%s_%lld", partition,
+                prefix, boot_text, static_cast<long long>(target.first));
+  std::snprintf(target.partial, sizeof(target.partial), "%s/%s-%lu.partial",
+                kDirectory, target.stem,
+                static_cast<unsigned long>(target.attempt));
   {
     BusLock lock;
-    const int fd = ::open(path, O_WRONLY | O_CREAT | O_EXCL, 0600);
+    const int fd = ::open(target.partial, O_WRONLY | O_CREAT | O_EXCL, 0600);
     if (fd >= 0) {
-      file = ::fdopen(fd, "wb");
-      if (!file)
+      target.file = ::fdopen(fd, "wb");
+      if (!target.file)
         ::close(fd);
     }
   }
-  if (!file) {
+  if (!target.file) {
     ++errors;
-    aqlog.printf("PARQUET ERROR operation=create errno=%d buffered=%u\n", errno,
-                 unsigned(count));
+    aqlog.printf("PARQUET ERROR operation=create errno=%d file=%s\n", errno,
+                 target.stem);
     return false;
   }
-  // Internal RAM staging is deliberately distinct from the PSRAM row buffer.
-  char staging[4096];
-  std::setvbuf(file, staging, _IOFBF, sizeof(staging));
-  char interval_text[12];
+  std::setvbuf(target.file, target.staging, _IOFBF, 4096);
+  auto compression = writer_state->lz4.configuration();
+  const auto result = target.writer.begin(
+      sink, target.file, target.workspace, writer_state->columns, field_count,
+      codec == Codec::Lz4Raw ? &compression : nullptr);
+  if (!result.ok) {
+    close_failed(target, "begin", result.error);
+    return false;
+  }
+  return true;
+}
+
+bool sync_file(OutputFile &target) {
+  const auto started = esp_timer_get_time();
+  bool ok;
+  {
+    BusLock lock;
+    ok = std::fflush(target.file) == 0 && ::fsync(::fileno(target.file)) == 0;
+  }
+  target.sync_us += esp_timer_get_time() - started;
+  sync_us = static_cast<std::uint32_t>(esp_timer_get_time() - started);
+  return ok;
+}
+
+// Appends the RAM batch as one row group and makes it durable.
+bool append_group(OutputFile &target, std::size_t count) {
+  writer_state->lz4.codec_us = 0;
+  // The compression configuration passed to begin() points at the shared
+  // LZ4 workspace, which is only touched inside row_group().
+  const auto started = esp_timer_get_time();
+  const auto result = target.writer.row_group(count, sequence);
+  const auto elapsed = esp_timer_get_time() - started;
+  target.writer_us += elapsed;
+  target.codec_us += writer_state->lz4.codec_us;
+  if (!result.ok) {
+    close_failed(target, "row-group", result.error);
+    return false;
+  }
+  if (!sync_file(target)) {
+    close_failed(target, "row-group-sync", nullptr);
+    return false;
+  }
+  target.last = writer_state->rows[count - 1].data[sequence];
+  target.rows += count;
+  if (!target.benchmark) {
+    open_rows = target.rows;
+    open_groups = target.writer.row_groups();
+  }
+  aqlog.printf("PARQUET GROUP file=%s ordinal=%u rows=%u first=%lld last=%lld "
+               "bytes=%llu writer_us=%lld codec=%s codec_us=%llu\n",
+               target.stem, unsigned(target.writer.row_groups() - 1),
+               unsigned(count), static_cast<long long>(target.first),
+               static_cast<long long>(target.last),
+               static_cast<unsigned long long>(target.writer.bytes_written()),
+               static_cast<long long>(elapsed), codec_name(target.codec),
+               static_cast<unsigned long long>(writer_state->lz4.codec_us));
+  return true;
+}
+
+// Writes the footer, syncs, closes, checks the structure and renames to
+// `<stem>-<last>-<attempt>.parquet`.
+bool finalize_file(OutputFile &target) {
+  char interval_text[12], groups_text[12];
   std::snprintf(interval_text, sizeof(interval_text), "%lu",
                 static_cast<unsigned long>(rotation_seconds.load()));
+  std::snprintf(groups_text, sizeof(groups_text), "%u",
+                unsigned(target.writer.row_groups()));
   const KeyValue metadata[] = {
       {"schema_version", kSchemaName},
       {"device_id", device_text},
       {"station_id", station_text},
       {"boot_id", boot_text},
       {"firmware", kFirmware},
-      {"dictionary_version", kSchemaName},
+      {"dictionary_version", kDictionaryVersion},
       {"dictionary_uri", kDictionaryUri},
       {"dictionary_sha256", kDictionarySha256},
       {"acquisition_config_id", kConfigurationId},
@@ -309,8 +448,11 @@ bool write_batch(std::size_t count, bool benchmark = false,
       {"calibration_id", kUnknown},
       {"time_semantics", kTimeSemantics},
       {"rotation_interval_s", interval_text},
-      {"compression", codec_name(codec)},
-      {"purpose", benchmark ? "codec-comparison-duplicate-rows" : "telemetry"},
+      {"row_groups", groups_text},
+      {"row_group_rows_max", "90"},
+      {"compression", codec_name(target.codec)},
+      {"purpose",
+       target.benchmark ? "codec-comparison-duplicate-rows" : "telemetry"},
       {"board", "CoreS3 ESP32-S3 rev0.2"},
       {"sample_interval_ms", "10000"},
       {"clock", "0=unsynchronized/null,1=host estimate; RTC calendar "
@@ -323,63 +465,98 @@ bool write_batch(std::size_t count, bool benchmark = false,
       {"magnetic_units", "M5Unified BMI270 auxiliary raw counts; uncalibrated"},
       {"unavailable", "SHT20 address collision; battery current unsupported; "
                       "camera/audio not sampled"},
-      {"durability",
-       "RAM batch; unfinished rows lost on reset; completed files retained"}};
-  writer_state->lz4.codec_us = 0;
-  auto compression = writer_state->lz4.configuration();
-  const auto writer_started = esp_timer_get_time();
-  const auto result = write_parquet(
-      sink, file, writer_state->columns, field_count, count,
-      writer_state->workspace, metadata, sizeof(metadata) / sizeof(metadata[0]),
-      codec == Codec::Lz4Raw ? &compression : nullptr);
-  const auto writer_elapsed = esp_timer_get_time() - writer_started;
-  bool ok = result.ok;
-  const auto sync_started = esp_timer_get_time();
+      {"durability", "RAM batch; unfinished rows lost on reset; each row group "
+                     "fsynced; footer at finalization; completed files "
+                     "retained"}};
+  const auto started = esp_timer_get_time();
+  const auto result = target.writer.finish(
+      metadata, sizeof(metadata) / sizeof(metadata[0]), kFirmware);
+  target.writer_us += esp_timer_get_time() - started;
+  if (!result.ok) {
+    close_failed(target, "finish", result.error);
+    return false;
+  }
+  bool ok = sync_file(target);
   {
     BusLock lock;
-    if (std::fflush(file) != 0)
-      ok = false;
-    if (::fsync(::fileno(file)) != 0)
-      ok = false;
-    if (std::fclose(file) != 0)
-      ok = false;
+    ok = std::fclose(target.file) == 0 && ok;
   }
-  sync_us = static_cast<std::uint32_t>(esp_timer_get_time() - sync_started);
+  target.file = nullptr;
+  if (!target.benchmark)
+    open_rows = open_groups = 0;
+  char ready[416];
+  std::snprintf(ready, sizeof(ready), "%s/%s-%lld-%lu.parquet", kDirectory,
+                target.stem, static_cast<long long>(target.last),
+                static_cast<unsigned long>(target.attempt));
   std::uint32_t size = 0, crc = 0;
   if (ok)
-    ok = finalized_file(path, size, crc) && size == result.bytes_written;
+    ok = finalized_file(target.partial, size, crc) &&
+         size == result.bytes_written;
   if (ok) {
     BusLock lock;
-    ok = ::access(ready, F_OK) != 0 && ::rename(path, ready) == 0;
+    ok = ::access(ready, F_OK) != 0 && ::rename(target.partial, ready) == 0;
     used_kib = SD.usedBytes() / 1024;
   }
-  write_us = static_cast<std::uint32_t>(esp_timer_get_time() - started);
+  write_us =
+      static_cast<std::uint32_t>(esp_timer_get_time() - target.opened_us);
   if (!ok) {
-    ++errors;
-    aqlog.printf("PARQUET ERROR operation=write file=%s reason=%s errno=%d "
-                 "buffered=%u\n",
-                 name, result.error ? result.error : "io-or-validation", errno,
-                 unsigned(count));
+    close_failed(target, "finalize", "io-or-validation");
     return false;
   }
   ++finalized;
   aqlog.printf(
-      "PARQUET READY name=%s.parquet rows=%u first=%lld last=%lld "
-      "bytes=%lu crc32=%08lx write_us=%lu sync_us=%lu heap_free=%lu "
-      "psram_free=%lu stack_free=%u codec=%s codec_us=%llu "
-      "writer_us=%lld codec_workspace_bytes=%u heap_min=%lu\n",
-      name, unsigned(count), static_cast<long long>(first),
-      static_cast<long long>(last), static_cast<unsigned long>(size),
-      static_cast<unsigned long>(crc),
+      "PARQUET READY name=%s-%lld-%lu.parquet rows=%u row_groups=%u "
+      "first=%lld last=%lld bytes=%lu crc32=%08lx write_us=%lu sync_us=%llu "
+      "heap_free=%lu psram_free=%lu stack_free=%u codec=%s codec_us=%llu "
+      "writer_us=%llu codec_workspace_bytes=%u heap_min=%lu\n",
+      target.stem, static_cast<long long>(target.last),
+      static_cast<unsigned long>(target.attempt), unsigned(target.rows),
+      unsigned(target.writer.row_groups()),
+      static_cast<long long>(target.first), static_cast<long long>(target.last),
+      static_cast<unsigned long>(size), static_cast<unsigned long>(crc),
       static_cast<unsigned long>(write_us.load()),
-      static_cast<unsigned long>(sync_us.load()),
+      static_cast<unsigned long long>(target.sync_us),
       static_cast<unsigned long>(ESP.getFreeHeap()),
       static_cast<unsigned long>(ESP.getFreePsram()),
-      unsigned(uxTaskGetStackHighWaterMark(nullptr)), codec_name(codec),
-      static_cast<unsigned long long>(writer_state->lz4.codec_us),
-      static_cast<long long>(writer_elapsed), unsigned(sizeof(Lz4Workspace)),
+      unsigned(uxTaskGetStackHighWaterMark(nullptr)), codec_name(target.codec),
+      static_cast<unsigned long long>(target.codec_us),
+      static_cast<unsigned long long>(target.writer_us),
+      unsigned(sizeof(Lz4Workspace)),
       static_cast<unsigned long>(ESP.getMinFreeHeap()));
   return true;
+}
+
+// Appends the RAM batch (if any) to the telemetry file, opening it when
+// needed, and finalizes the file when `finalize` is set or the file is full.
+// On success `count` is zero. Failure leaves the .partial and returns false.
+bool commit(std::size_t &count, bool finalize) {
+  OutputFile &target = writer_state->telemetry;
+  if (count) {
+    if (!target.open() && !create_file(target, selected_codec, false))
+      return false;
+    if (!append_group(target, count))
+      return false;
+    count = 0;
+    buffered = 0;
+  }
+  if (target.open() &&
+      (finalize || target.writer.row_groups() >= groups_per_file() ||
+       target.writer.row_groups() >= kMaxRowGroups))
+    return finalize_file(target);
+  return true;
+}
+
+// Flush everything: RAM batch into a row group, then the footer.
+bool write_batch(std::size_t &count) { return commit(count, true); }
+
+// A one-row-group diagnostic copy of the RAM batch outside station trees;
+// the rows stay buffered for normal telemetry rotation.
+bool write_benchmark(std::size_t count, Codec codec) {
+  OutputFile &target = writer_state->benchmark;
+  if (!count || target.open())
+    return false;
+  return create_file(target, codec, true) && append_group(target, count) &&
+         finalize_file(target);
 }
 
 bool safe_name(const char *name) {
@@ -575,7 +752,7 @@ std::size_t build_status_json(char *out, std::size_t size) {
       "{\"up_s\":%lu,\"int_s\":%lu,\"buf\":%lu,\"fin\":%lu,\"drop\":%lu,"
       "\"err\":%lu,\"miss\":%lld,\"fail\":%u,\"codec\":\"%s\",\"utc\":%u,"
       "\"gen\":%ld,\"sd\":%u,\"sd_kib\":%lu,\"sd_used_kib\":%lu,\"heap\":%lu,"
-      "\"part\":%lu}",
+      "\"part\":%lu,\"open\":%lu,\"open_rg\":%lu}",
       static_cast<unsigned long>(esp_timer_get_time() / 1000000),
       static_cast<unsigned long>(rotation_seconds.load()),
       static_cast<unsigned long>(buffered.load()),
@@ -588,7 +765,9 @@ std::size_t build_status_json(char *out, std::size_t size) {
       storage_ok.load() ? 1U : 0U, static_cast<unsigned long>(total_kib.load()),
       static_cast<unsigned long>(used_kib.load()),
       static_cast<unsigned long>(ESP.getFreeHeap()),
-      static_cast<unsigned long>(partials_seen.load()));
+      static_cast<unsigned long>(partials_seen.load()),
+      static_cast<unsigned long>(open_rows.load()),
+      static_cast<unsigned long>(open_groups.load()));
   return written > 0 && std::size_t(written) < size ? std::size_t(written) : 0;
 }
 
@@ -1035,11 +1214,14 @@ void handle_control_request(const ble::ControlRequest &request,
     return;
   }
   case ble::kOpFlush: {
-    if (!state.count || !state.storage_ready) {
+    if ((!state.count && !writer_state->telemetry.open()) ||
+        !state.storage_ready) {
       respond_error(ble::kOpFlush, ble::kErrNothingToFlush, nullptr);
       return;
     }
-    const auto rows = static_cast<std::uint16_t>(state.count);
+    // Rows reported: RAM batch plus row groups already on the card.
+    const auto rows =
+        static_cast<std::uint16_t>(state.count + open_rows.load());
     if (!write_batch(state.count)) {
       state.failed = true;
       worker_failed = true;
@@ -1047,8 +1229,6 @@ void handle_control_request(const ble::ControlRequest &request,
       publish_status();
       return;
     }
-    state.count = 0;
-    buffered = 0;
     state.failed = false;
     worker_failed = false;
     std::uint8_t frame[7];
@@ -1084,11 +1264,9 @@ void handle_control_request(const ble::ControlRequest &request,
   }
   case ble::kOpReboot: {
     // Never lose the RAM batch to a reboot the owner asked for.
-    if (state.count && state.storage_ready && !state.failed) {
-      if (write_batch(state.count)) {
-        state.count = 0;
-        buffered = 0;
-      } else {
+    if ((state.count || writer_state->telemetry.open()) &&
+        state.storage_ready && !state.failed) {
+      if (!write_batch(state.count)) {
         state.failed = true;
         worker_failed = true;
       }
@@ -1169,37 +1347,28 @@ void storage_worker(void *) {
       if (!storage_ready || failed || count == kMaxRows) {
         ++dropped;
       } else {
-        // Never mix clock epochs or UTC windows (including midnight) in a file.
-        if (count) {
+        // Never mix clock epochs or UTC windows (including midnight) in a
+        // file: the open file, or else the RAM batch, is the reference.
+        const OutputFile &open = writer_state->telemetry;
+        bool fits = true;
+        if (open.open())
+          fits = same_window(row, open.epoch, open.dated, open.window);
+        else if (count) {
           const auto &previous = writer_state->rows[0];
-          const auto window_ns =
-              std::int64_t(rotation_seconds.load()) * 1000000000;
-          const bool different_window =
-              row.valid[event_time_utc_ns] &&
-              previous.valid[event_time_utc_ns] &&
-              row.data[event_time_utc_ns] / window_ns !=
-                  previous.data[event_time_utc_ns] / window_ns;
-          if (row.data[clock_epoch] != previous.data[clock_epoch] ||
-              different_window) {
-            if (write_batch(count)) {
-              count = 0;
-              buffered = 0;
-            } else {
-              failed = true;
-              ++dropped;
-              continue;
-            }
-          }
+          fits = same_window(
+              row, previous.data[clock_epoch],
+              previous.valid[event_time_utc_ns] != 0,
+              previous.valid[event_time_utc_ns] ? window_index(previous) : 0);
+        }
+        if (!fits && !write_batch(count)) {
+          failed = true;
+          ++dropped;
+          continue;
         }
         writer_state->rows[count++] = row;
         buffered = count;
-        if (count >= rotation_seconds.load() / 10) {
-          if (write_batch(count)) {
-            count = 0;
-            buffered = 0;
-          } else
-            failed = true;
-        }
+        if (count >= rows_per_group() && !commit(count, false))
+          failed = true;
       }
     }
     worker_failed = failed;
@@ -1213,12 +1382,15 @@ void storage_worker(void *) {
       continue;
     }
     if (std::strcmp(command.text, "parquet status") == 0) {
-      aqlog.printf("PARQUET STATUS interval_s=%lu buffered=%u finalized=%lu "
+      aqlog.printf("PARQUET STATUS interval_s=%lu buffered=%u open_rows=%lu "
+                   "open_groups=%lu finalized=%lu "
                    "dropped=%lu errors=%lu queue_peak=%lu failed=%s station=%s "
                    "codec=%s schema=%s config=%s deployment=unknown "
                    "calibration=unknown\n",
                    static_cast<unsigned long>(rotation_seconds.load()),
                    unsigned(count),
+                   static_cast<unsigned long>(open_rows.load()),
+                   static_cast<unsigned long>(open_groups.load()),
                    static_cast<unsigned long>(finalized.load()),
                    static_cast<unsigned long>(dropped.load()),
                    static_cast<unsigned long>(errors.load()),
@@ -1240,8 +1412,8 @@ void storage_worker(void *) {
       if (!count || !storage_ready || failed) {
         aqlog.println("PARQUET ERROR operation=codec-test "
                       "reason=empty-or-storage-failed");
-      } else if (write_batch(count, true, Codec::Uncompressed) &&
-                 write_batch(count, true, Codec::Lz4Raw)) {
+      } else if (write_benchmark(count, Codec::Uncompressed) &&
+                 write_benchmark(count, Codec::Lz4Raw)) {
         // Keep the original batch for normal telemetry rotation. Benchmark
         // copies live outside station trees and are explicitly labeled.
         aqlog.printf("PARQUET BENCH END rows=%u retained_for_telemetry=true\n",
@@ -1249,37 +1421,36 @@ void storage_worker(void *) {
       }
     } else if (std::strcmp(command.text, "parquet codec none") == 0 ||
                std::strcmp(command.text, "parquet codec lz4") == 0) {
-      if (count && !write_batch(count)) {
+      // A file holds one codec: finish the open one before switching.
+      if (!write_batch(count)) {
         failed = true;
         continue;
       }
-      count = 0;
-      buffered = 0;
       failed = false;
       selected_codec =
           command.text[14] == 'l' ? Codec::Lz4Raw : Codec::Uncompressed;
       aqlog.printf("PARQUET CONFIG codec=%s persistent=false\n",
                    codec_name(selected_codec));
     } else if (std::strcmp(command.text, "parquet flush") == 0) {
-      if (count && storage_ready) {
-        if (write_batch(count)) {
-          count = 0;
-          buffered = 0;
+      if ((count || writer_state->telemetry.open()) && storage_ready) {
+        if (write_batch(count))
           failed = false;
-        }
       } else
         aqlog.println(
             "PARQUET ERROR operation=flush reason=empty-or-no-storage");
-    } else if (std::strcmp(command.text, "parquet interval 600") == 0 ||
-               std::strcmp(command.text, "parquet interval 900") == 0) {
-      if (count && !write_batch(count)) {
+    } else if (std::strncmp(command.text, "parquet interval ", 17) == 0 &&
+               (std::strcmp(command.text + 17, "600") == 0 ||
+                std::strcmp(command.text + 17, "900") == 0 ||
+                std::strcmp(command.text + 17, "1800") == 0 ||
+                std::strcmp(command.text + 17, "3600") == 0)) {
+      // The window defines the file: finish the open one first.
+      if (!write_batch(count)) {
         failed = true;
         continue;
       }
-      count = 0;
-      buffered = 0;
       failed = false;
-      rotation_seconds = command.text[17] == '6' ? 600 : 900;
+      rotation_seconds = static_cast<std::uint32_t>(
+          std::strtoul(command.text + 17, nullptr, 10));
       aqlog.printf("PARQUET CONFIG interval_s=%lu persistent=false\n",
                    static_cast<unsigned long>(rotation_seconds.load()));
     } else if (std::strncmp(command.text, "parquet time ", 13) == 0) {
@@ -1482,6 +1653,8 @@ void begin_logger(bool sd_mounted) {
     return;
   }
   new (writer_state) WriterState{};
+  writer_state->telemetry.staging = staging_telemetry;
+  writer_state->benchmark.staging = staging_benchmark;
   prepare_columns();
   const bool light = light_sensor.begin();
   next_sample_us = esp_timer_get_time() + kSampleUs;
@@ -1493,11 +1666,12 @@ void begin_logger(bool sd_mounted) {
   accepting = true;
   aqlog.printf(
       "PARQUET BEGIN schema=%s columns=%u sample_s=10 "
-      "interval_s=900 max_rows=90 psram_workspace_bytes=%u row_bytes=%u "
-      "boot=%s station=%s light_available=%s codec=UNCOMPRESSED\n",
-      kSchemaName, unsigned(field_count), unsigned(sizeof(WriterState)),
-      unsigned(sizeof(Sample)), boot_text, station_text,
-      light ? "true" : "false");
+      "interval_s=900 max_rows=90 max_row_groups=%u psram_workspace_bytes=%u "
+      "row_bytes=%u boot=%s station=%s light_available=%s "
+      "codec=UNCOMPRESSED\n",
+      kSchemaName, unsigned(field_count), unsigned(kMaxRowGroups),
+      unsigned(sizeof(WriterState)), unsigned(sizeof(Sample)), boot_text,
+      station_text, light ? "true" : "false");
 }
 
 void poll_logger(const PmsSnapshot &pms) {
