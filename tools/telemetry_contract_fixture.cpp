@@ -17,8 +17,11 @@ bool sink(void *context, const std::uint8_t *bytes, std::size_t count) {
 
 int main(int argc, char **argv) {
   if (argc == 2 && std::strcmp(argv[1], "dictionary") == 0) {
-    std::printf("{\"schema\":\"%s\",\"sha256\":\"%s\",\"fields\":[",
-                kSchemaName, kDictionarySha256);
+    std::printf("{\"schema\":\"%s\",\"schema_version\":%d,"
+                "\"dictionary\":\"%s\",\"firmware\":\"%s\",\"sha256\":\"%s\","
+                "\"fields\":[",
+                kSchemaName, int(kSchemaVersion), kDictionaryVersion, kFirmware,
+                kDictionarySha256);
     for (std::size_t i = 0; i < field_count; ++i) {
       const auto &f = kFields[i];
       // Dictionary tokens are compile-time literals, validated by the host.
@@ -72,7 +75,7 @@ int main(int argc, char **argv) {
   prepare_columns(columns, rows);
   const KeyValue metadata[] = {{"schema_version", kSchemaName},
                                {"firmware", kFirmware},
-                               {"dictionary_version", kSchemaName},
+                               {"dictionary_version", kDictionaryVersion},
                                {"dictionary_uri", kDictionaryUri},
                                {"dictionary_sha256", kDictionarySha256},
                                {"acquisition_config_id", kConfigurationId},
@@ -84,10 +87,16 @@ int main(int argc, char **argv) {
   FILE *file = std::fopen(argv[1], "wb");
   if (!file)
     return 3;
-  const auto result =
-      write_parquet(sink, file, columns, field_count, 90, workspace, metadata,
-                    sizeof(metadata) / sizeof(metadata[0]),
-                    compressed ? &compression : nullptr);
+  // Same calls as the logger: one row group per 90-row batch, rows ascending
+  // by sequence, firmware identity in created_by.
+  Writer writer;
+  auto result = writer.begin(sink, file, workspace, columns, field_count,
+                             compressed ? &compression : nullptr);
+  if (result.ok)
+    result = writer.row_group(90, sequence);
+  if (result.ok)
+    result = writer.finish(metadata, sizeof(metadata) / sizeof(metadata[0]),
+                           kFirmware);
   const bool closed = std::fclose(file) == 0;
   return result.ok && closed ? 0 : 4;
 }

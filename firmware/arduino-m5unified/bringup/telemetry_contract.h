@@ -9,9 +9,14 @@
 
 namespace telemetry {
 namespace contract {
-constexpr std::int32_t kSchemaVersion = 2;
-constexpr const char *kSchemaName = "cores3-telemetry-v2";
-constexpr const char *kFirmware = "arduino-cores3-parquet-v5";
+// File schema v3: the unchanged v2 dictionary (77 leaves) plus TIMESTAMP(NANOS,
+// UTC) annotations on the UTC fields, per-chunk min/max statistics and up to
+// kMaxRowGroups row groups per file. The dictionary version tracks the bytes
+// of telemetry_fields.inc; the schema version tracks what a reader sees.
+constexpr std::int32_t kSchemaVersion = 3;
+constexpr const char *kSchemaName = "cores3-telemetry-v3";
+constexpr const char *kDictionaryVersion = "cores3-telemetry-v2";
+constexpr const char *kFirmware = "arduino-cores3-parquet-v6";
 constexpr const char *kDictionaryUri =
     "https://github.com/walkthru-earth/m5stack-aq-parquet/blob/main/"
     "firmware/arduino-m5unified/bringup/telemetry_fields.inc";
@@ -69,10 +74,22 @@ struct Sample {
   }
 };
 
+// Fields whose unit is nanoseconds since the Unix epoch are the UTC instants;
+// the annotation changes what readers present, never the stored INT64.
+constexpr const char *kUtcNanosUnit = "ns_since_unix_epoch";
+inline LogicalType logical_type(const Definition &field) {
+  return field.type == PhysicalType::Int64 &&
+                 std::strcmp(field.unit, kUtcNanosUnit) == 0
+             ? LogicalType::TimestampNanosUtc
+             : LogicalType::None;
+}
+
 inline void prepare_columns(Column *columns, Sample *rows) {
   for (std::size_t i = 0; i < field_count; ++i)
-    columns[i] = Column{kFields[i].name, kFields[i].type,   &rows[0].data[i],
-                        sizeof(Sample),  &rows[0].valid[i], sizeof(Sample)};
+    columns[i] =
+        Column{kFields[i].name,         kFields[i].type,   &rows[0].data[i],
+               sizeof(Sample),          &rows[0].valid[i], sizeof(Sample),
+               logical_type(kFields[i])};
 }
 
 // Inputs are a single coherent anchor snapshot taken under the clock mutex.
