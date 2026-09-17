@@ -1,5 +1,8 @@
 // Build through pixi; uses exactly the firmware writer on the host.
-// Usage: parquet_fixture output.parquet [rows=90] [columns=8]
+// Usage: parquet_fixture output.parquet [rows=90] [columns=8] [none|lz4]
+//        [row_groups=1]
+// rows is per row group; row group g holds global rows g*rows .. g*rows+rows-1
+// and the row buffer is refilled between groups, as the logger does.
 #include "../firmware/arduino-m5unified/bringup/lz4_codec.h"
 #include "../firmware/arduino-m5unified/bringup/parquet_writer.h"
 
@@ -19,6 +22,7 @@ struct Row {
   uint8_t alternating;
   uint8_t absent;
   uint8_t present;
+  float positive_zero;
 };
 
 bool file_sink(void *context, const uint8_t *bytes, size_t length) {
@@ -33,19 +37,11 @@ bool fail_sink(void *context, const uint8_t *, size_t) {
   auto &state = *static_cast<FailingSink *>(context);
   return ++state.calls == 1;
 }
-} // namespace
 
-int main(int argc, char **argv) {
-  if (argc < 2 || argc > 5)
-    return 2;
-  const size_t count = argc > 2 ? strtoul(argv[2], nullptr, 10) : 90;
-  const size_t column_count = argc > 3 ? strtoul(argv[3], nullptr, 10) : 8;
-  if (count > telemetry::kMaxRows || column_count < 8 ||
-      column_count > telemetry::kMaxColumns)
-    return 2;
-  std::vector<Row> rows(count ? count : 1);
-  for (size_t i = 0; i < count; ++i) {
-    rows[i] = {1700000000000LL + static_cast<int64_t>(i) * 10000,
+void fill(std::vector<Row> &rows, size_t count, size_t first_index) {
+  for (size_t r = 0; r < count; ++r) {
+    const size_t i = first_index + r;
+    rows[r] = {1700000000000LL + static_cast<int64_t>(i) * 10000,
                i % 2 ? std::numeric_limits<int32_t>::max()
                      : std::numeric_limits<int32_t>::min(),
                static_cast<float>(i) * 0.25F - 10.0F,
@@ -53,14 +49,33 @@ int main(int argc, char **argv) {
                      : std::numeric_limits<int64_t>::min(),
                static_cast<uint8_t>(i % 2),
                0,
-               7};
+               7,
+               0.0F};
   }
-  if (count > 4) {
+  // Only the first row group carries the special float values, so a second
+  // group has plain finite bounds and no NaN.
+  if (count > 4 && first_index == 0) {
     rows[0].temperature = -0.0F;
     rows[1].temperature = std::numeric_limits<float>::infinity();
     rows[2].temperature = -std::numeric_limits<float>::infinity();
     rows[3].temperature = std::numeric_limits<float>::quiet_NaN();
   }
+}
+} // namespace
+
+int main(int argc, char **argv) {
+  if (argc < 2 || argc > 6)
+    return 2;
+  const size_t count = argc > 2 ? strtoul(argv[2], nullptr, 10) : 90;
+  const size_t column_count = argc > 3 ? strtoul(argv[3], nullptr, 10) : 8;
+  const bool compressed = argc > 4 && strcmp(argv[4], "lz4") == 0;
+  const size_t groups = argc > 5 ? strtoul(argv[5], nullptr, 10) : 1;
+  if (count > telemetry::kMaxRows || column_count < 8 ||
+      column_count > telemetry::kMaxColumns || !groups ||
+      groups > telemetry::kMaxRowGroups)
+    return 2;
+  std::vector<Row> rows(count ? count : 1);
+  fill(rows, count, 0);
   const Row &first = rows.front();
   using telemetry::PhysicalType;
   std::array<telemetry::Column, telemetry::kMaxColumns> columns;
@@ -78,12 +93,18 @@ int main(int argc, char **argv) {
                 sizeof(Row),        &first.alternating,  sizeof(Row)};
   columns[7] = {"all_present", PhysicalType::Float, &first.temperature,
                 sizeof(Row),   &first.present,      sizeof(Row)};
+  // time_ms doubles as a TIMESTAMP(NANOS, UTC) leaf; the value is just an
+  // INT64 to the writer, the annotation is what readers see.
+  columns[0].logical = telemetry::LogicalType::TimestampNanosUtc;
   std::array<std::array<char, 32>, telemetry::kMaxColumns> names{};
   for (size_t i = 8; i < column_count; ++i) {
     snprintf(names[i].data(), names[i].size(), "extra_%02zu", i);
     columns[i] = {names[i].data(), PhysicalType::Float, &first.temperature,
                   sizeof(Row)};
   }
+  if (column_count > 8)
+    columns[8] = {"positive_zero", PhysicalType::Float, &first.positive_zero,
+                  sizeof(Row)};
   telemetry::Workspace workspace{};
   telemetry::Lz4Workspace lz4{};
   // Fixed-capacity adapter checks include incompressible/empty/short blocks.
@@ -108,7 +129,6 @@ int main(int argc, char **argv) {
       return 9;
   }
   auto compression = lz4.configuration();
-  const bool compressed = argc == 5;
   // Large fixtures exercise format limits on the host only. Firmware remains
   // fixed at 1024-byte page scratch and 90 rows.
   std::vector<uint8_t> raw(count * 10 + 4);
@@ -123,15 +143,22 @@ int main(int argc, char **argv) {
   FILE *file = fopen(argv[1], "wb");
   if (!file)
     return 3;
-  const auto result = telemetry::write_parquet(
-      file_sink, file, columns.data(), column_count, count, workspace, metadata,
-      2, compressed ? &compression : nullptr);
+  telemetry::Writer writer;
+  auto result = writer.begin(file_sink, file, workspace, columns.data(),
+                             column_count, compressed ? &compression : nullptr);
+  for (size_t g = 0; g < groups && result.ok && count; ++g) {
+    fill(rows, count, g * count);
+    result = writer.row_group(count, 0); // time_ms ascends within a group
+  }
+  if (result.ok)
+    result = writer.finish(metadata, 2, "fixture");
   const bool closed = fclose(file) == 0;
   if (!result.ok || !closed) {
     fprintf(stderr, "write failed: %s\n",
             result.error ? result.error : "close");
     return 4;
   }
+  fill(rows, count, 0);
   FailingSink failure;
   const auto failed = telemetry::write_parquet(
       fail_sink, &failure, columns.data(), column_count, count, workspace,
@@ -160,8 +187,28 @@ int main(int argc, char **argv) {
         metadata, 2, &compression);
     if (rejected.ok || rejected.bytes_written)
       return 7;
+    // A logical annotation on the wrong physical type is refused up front.
+    auto wrong = columns;
+    wrong[1].logical = telemetry::LogicalType::TimestampNanosUtc;
+    failure.calls = 0;
+    const auto mismatched = telemetry::write_parquet(
+        fail_sink, &failure, wrong.data(), column_count, count, workspace);
+    if (mismatched.ok || mismatched.bytes_written || failure.calls)
+      return 10;
+    // Row-group capacity is enforced, and a failed writer stays inert.
+    telemetry::Writer capacity;
+    failure.calls = 0;
+    auto step =
+        capacity.begin([](void *, const uint8_t *, size_t) { return true; },
+                       nullptr, workspace, columns.data(), column_count);
+    for (size_t g = 0; g < telemetry::kMaxRowGroups && step.ok; ++g)
+      step = capacity.row_group(1);
+    if (!step.ok || capacity.row_groups() != telemetry::kMaxRowGroups ||
+        capacity.row_group(1).ok || capacity.finish().ok || capacity.active())
+      return 11;
   }
-  printf("rows=%zu columns=%zu bytes=%llu workspace=%zu\n", count, column_count,
+  printf("rows=%zu columns=%zu row_groups=%zu bytes=%llu workspace=%zu\n",
+         count, column_count, count ? groups : 0,
          static_cast<unsigned long long>(result.bytes_written),
          sizeof(workspace));
   return 0;

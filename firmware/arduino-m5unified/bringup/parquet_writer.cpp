@@ -1,12 +1,18 @@
 #include "parquet_writer.h"
 
+#include <cmath>
 #include <limits>
 #include <string.h>
 
-// Wire format references (checked 2026-09-08):
-// https://github.com/apache/parquet-format/blob/master/src/main/thrift/parquet.thrift
+// Wire format references (checked 2026-09-17 against parquet-format 2.14.0):
+// https://github.com/apache/parquet-format/blob/apache-parquet-format-2.14.0/src/main/thrift/parquet.thrift
 // https://parquet.apache.org/docs/file-format/data-pages/encodings/
 // https://github.com/apache/thrift/blob/master/doc/specs/thrift-compact-protocol.md
+// Statistics follow the TYPE_ORDER writer rules introduced in 2.13 (nan_count,
+// NaN exclusion, signed zero normalization) because PyArrow 25 and DuckDB 1.5
+// ignore statistics under IEEE_754_TOTAL_ORDER. The deprecated min/max fields
+// are omitted on purpose: every targeted reader uses min_value/max_value, and
+// duplicating them would grow the footer by two values per column chunk.
 // This is a deliberately small format subset, not a general Parquet library.
 namespace telemetry {
 namespace {
@@ -14,12 +20,18 @@ namespace {
 static_assert(sizeof(float) == 4 && std::numeric_limits<float>::is_iec559,
               "Parquet FLOAT requires IEEE 754 binary32");
 
-constexpr uint8_t kI32 = 5, kI64 = 6, kBinary = 8, kList = 9, kStruct = 12;
+constexpr uint8_t kTrue = 1, kFalse = 2, kI16 = 4, kI32 = 5, kI64 = 6,
+                  kBinary = 8, kList = 9, kStruct = 12;
+constexpr const char *kCreatedBy = "m5stack-aq-parquet version 0.2";
 
 class Output {
 public:
-  Output(Sink sink, void *context, Workspace &workspace)
-      : sink_(sink), context_(context), workspace_(workspace) {}
+  // Staging state lives in the caller so bytes may stay buffered between
+  // calls (the Writer keeps a row group's tail and the magic there).
+  Output(Sink sink, void *context, Workspace &workspace, size_t &used,
+         uint64_t &position, uint64_t &accepted)
+      : sink_(sink), context_(context), workspace_(workspace), used_(used),
+        position_(position), accepted_(accepted) {}
 
   void bytes(const void *source, size_t size) {
     const auto *p = static_cast<const uint8_t *>(source);
@@ -52,10 +64,19 @@ public:
       value >>= 8;
     }
   }
-  void string(const char *value) {
-    const size_t length = strlen(value);
+  // One length-prefixed string assembled from up to four parts.
+  void string(const char *a, const char *b = nullptr, const char *c = nullptr,
+              const char *d = nullptr) {
+    const char *parts[] = {a, b, c, d};
+    size_t length = 0;
+    for (const char *part : parts) {
+      // cppcheck-suppress useStlAlgorithm
+      length += part ? strlen(part) : 0;
+    }
     varint(length);
-    bytes(value, length);
+    for (const char *part : parts)
+      if (part)
+        bytes(part, strlen(part));
   }
   void list(uint8_t type, size_t count) {
     if (count < 15) {
@@ -75,15 +96,14 @@ public:
   }
   bool ok() const { return ok_; }
   uint64_t position() const { return position_; }
-  uint64_t accepted() const { return accepted_; }
 
 private:
   Sink sink_;
   void *context_;
   Workspace &workspace_;
-  size_t used_ = 0;
-  uint64_t position_ = 0;
-  uint64_t accepted_ = 0;
+  size_t &used_;
+  uint64_t &position_;
+  uint64_t &accepted_;
   bool ok_ = true;
 };
 
@@ -106,9 +126,16 @@ public:
     field(id, type);
     out_.integer(value);
   }
+  // Compact protocol folds a bool into the field header type nibble.
+  void boolean(uint8_t id, bool value) { field(id, value ? kTrue : kFalse); }
   void string(uint8_t id, const char *value) {
     field(id, kBinary);
     out_.string(value);
+  }
+  void binary(uint8_t id, uint64_t bits, size_t width) {
+    field(id, kBinary);
+    out_.varint(width);
+    out_.little_endian(bits, width);
   }
   void list(uint8_t id, uint8_t type, size_t count) {
     field(id, kList);
@@ -171,25 +198,95 @@ size_t payload_size(const Column &column, size_t rows) {
          (column.valid ? 4 + definition_levels(column, rows) : 0);
 }
 
+uint64_t value_bits(const Column &column, size_t row) {
+  const auto *values = static_cast<const uint8_t *>(column.values);
+  if (column.type == PhysicalType::Int64) {
+    uint64_t value;
+    memcpy(&value, values + row * column.stride, sizeof(value));
+    return value;
+  }
+  uint32_t value;
+  memcpy(&value, values + row * column.stride, sizeof(value));
+  return value;
+}
+
 void payload_bytes(Output &out, const Column &column, size_t rows) {
   if (column.valid) {
     out.little_endian(definition_levels(column, rows), 4);
     definition_levels(column, rows, &out);
   }
-  const auto *values = static_cast<const uint8_t *>(column.values);
   for (size_t row = 0; row < rows && out.ok(); ++row) {
+    // memcpy avoids alignment/aliasing assumptions; emit explicitly LE.
+    if (present(column, row))
+      out.little_endian(value_bits(column, row), width(column.type));
+  }
+}
+
+uint32_t float_bits(float value) {
+  uint32_t bits;
+  memcpy(&bits, &value, sizeof(bits));
+  return bits;
+}
+
+// Bounds use the column's TYPE_ORDER: signed integers; floats compared as
+// values with NaN excluded, then zero signs normalized for the footer.
+void statistics(const Column &column, size_t rows, ChunkRecord &record) {
+  record.null_count = rows - present_count(column, rows);
+  record.nan_count = 0;
+  record.has_bounds = false;
+  record.min = record.max = 0;
+  int32_t min32 = 0, max32 = 0;
+  int64_t min64 = 0, max64 = 0;
+  float minf = 0, maxf = 0;
+  for (size_t row = 0; row < rows; ++row) {
     if (!present(column, row))
       continue;
-    // memcpy avoids alignment/aliasing assumptions; emit explicitly LE.
-    if (column.type == PhysicalType::Int64) {
-      uint64_t value;
-      memcpy(&value, values + row * column.stride, sizeof(value));
-      out.little_endian(value, sizeof(value));
+    const uint64_t bits = value_bits(column, row);
+    if (column.type == PhysicalType::Float) {
+      float value;
+      const uint32_t narrow = static_cast<uint32_t>(bits);
+      memcpy(&value, &narrow, sizeof(value));
+      if (std::isnan(value)) {
+        ++record.nan_count;
+        continue;
+      }
+      if (!record.has_bounds || value < minf)
+        minf = value;
+      if (!record.has_bounds || value > maxf)
+        maxf = value;
+    } else if (column.type == PhysicalType::Int64) {
+      int64_t value;
+      memcpy(&value, &bits, sizeof(value));
+      if (!record.has_bounds || value < min64)
+        min64 = value;
+      if (!record.has_bounds || value > max64)
+        max64 = value;
     } else {
-      uint32_t value;
-      memcpy(&value, values + row * column.stride, sizeof(value));
-      out.little_endian(value, sizeof(value));
+      int32_t value;
+      const uint32_t narrow = static_cast<uint32_t>(bits);
+      memcpy(&value, &narrow, sizeof(value));
+      if (!record.has_bounds || value < min32)
+        min32 = value;
+      if (!record.has_bounds || value > max32)
+        max32 = value;
     }
+    record.has_bounds = true;
+  }
+  if (!record.has_bounds)
+    return;
+  if (column.type == PhysicalType::Float) {
+    // Signed zeros compare equal; the footer must show -0.0 low, +0.0 high.
+    record.min = minf == 0.0F ? float_bits(-0.0F) : float_bits(minf);
+    record.max = maxf == 0.0F ? float_bits(0.0F) : float_bits(maxf);
+  } else if (column.type == PhysicalType::Int64) {
+    memcpy(&record.min, &min64, sizeof(record.min));
+    memcpy(&record.max, &max64, sizeof(record.max));
+  } else {
+    uint32_t bits;
+    memcpy(&bits, &min32, sizeof(bits));
+    record.min = bits;
+    memcpy(&bits, &max32, sizeof(bits));
+    record.max = bits;
   }
 }
 
@@ -208,7 +305,7 @@ bool memory_sink(void *context, const uint8_t *data, size_t size) {
 }
 
 bool page(Output &out, const Column &column, size_t rows, Workspace &workspace,
-          const Compression *compression, uint64_t &uncompressed_size) {
+          const Compression *compression, ChunkRecord &record) {
   const size_t definitions = column.valid ? definition_levels(column, rows) : 0;
   const size_t payload = present_count(column, rows) * width(column.type) +
                          (column.valid ? 4 + definitions : 0);
@@ -219,7 +316,10 @@ bool page(Output &out, const Column &column, size_t rows, Workspace &workspace,
     if (!out.ok())
       return false;
     MemorySink memory{compression->raw, compression->raw_capacity};
-    Output raw(memory_sink, &memory, workspace);
+    size_t scratch_used = 0;
+    uint64_t scratch_position = 0, scratch_accepted = 0;
+    Output raw(memory_sink, &memory, workspace, scratch_used, scratch_position,
+               scratch_accepted);
     payload_bytes(raw, column, rows);
     raw.flush();
     if (!raw.ok() || memory.used != payload)
@@ -243,7 +343,7 @@ bool page(Output &out, const Column &column, size_t rows, Workspace &workspace,
   data.number(4, kI32, 3); // RLE repetition levels (no bytes: max level 0)
   data.end();
   header.end();
-  uncompressed_size = out.position() - header_start + payload;
+  record.uncompressed_size = out.position() - header_start + payload;
   if (compression)
     out.bytes(compression->encoded, compressed);
   else
@@ -251,9 +351,90 @@ bool page(Output &out, const Column &column, size_t rows, Workspace &workspace,
   return out.ok();
 }
 
-void footer(Output &out, const Column *columns, size_t count, size_t rows,
-            const Workspace &workspace, const KeyValue *metadata,
-            size_t metadata_count, Codec codec) {
+void schema_element(Output &out, const Column &column) {
+  Struct leaf(out);
+  leaf.number(1, kI32, static_cast<uint8_t>(column.type));
+  leaf.number(3, kI32, column.valid ? 1 : 0);
+  leaf.string(4, column.name);
+  if (column.logical == LogicalType::TimestampNanosUtc) {
+    leaf.field(10, kStruct); // LogicalType union
+    Struct logical(out);
+    logical.field(8, kStruct); // TIMESTAMP
+    Struct timestamp(out);
+    timestamp.boolean(1, true);  // isAdjustedToUTC
+    timestamp.field(2, kStruct); // TimeUnit union
+    Struct unit(out);
+    unit.field(3, kStruct); // NANOS
+    Struct nanos(out);
+    nanos.end();
+    unit.end();
+    timestamp.end();
+    logical.end();
+  }
+  leaf.end();
+}
+
+void column_chunk(Output &out, const Column &column, const ChunkRecord &record,
+                  uint64_t rows, Codec codec) {
+  Struct chunk(out);
+  chunk.number(2, kI64, 0); // metadata lives only in this footer
+  chunk.field(3, kStruct);
+  Struct meta(out);
+  meta.number(1, kI32, static_cast<uint8_t>(column.type));
+  meta.list(2, kI32, 2);
+  out.integer(0); // PLAIN
+  out.integer(3); // RLE
+  meta.list(3, kBinary, 1);
+  out.string(column.name);
+  meta.number(4, kI32, static_cast<uint8_t>(codec));
+  meta.number(5, kI64, rows);
+  meta.number(6, kI64, record.uncompressed_size);
+  meta.number(7, kI64, record.size);
+  meta.number(9, kI64, record.offset);
+  meta.field(12, kStruct);
+  Struct stats(out);
+  stats.number(3, kI64, record.null_count);
+  if (record.has_bounds) {
+    const size_t bytes = width(column.type);
+    stats.binary(5, record.max, bytes);
+    stats.binary(6, record.min, bytes);
+    stats.boolean(7, true);
+    stats.boolean(8, true);
+  }
+  if (column.type == PhysicalType::Float)
+    stats.number(9, kI64, record.nan_count);
+  stats.end();
+  meta.end();
+  chunk.end();
+}
+
+void row_group_metadata(Output &out, const Column *columns, size_t count,
+                        const ChunkRecord *chunks, const GroupRecord &group,
+                        size_t ordinal, Codec codec) {
+  Struct row_group(out);
+  row_group.list(1, kStruct, count);
+  for (size_t i = 0; i < count; ++i)
+    column_chunk(out, columns[i], chunks[i], group.rows, codec);
+  row_group.number(2, kI64, group.uncompressed_size);
+  row_group.number(3, kI64, group.rows);
+  if (group.sorted_by >= 0) {
+    row_group.list(4, kStruct, 1);
+    Struct sorting(out);
+    sorting.number(1, kI32, static_cast<uint64_t>(group.sorted_by));
+    sorting.boolean(2, false); // ascending
+    sorting.boolean(3, false); // nulls last
+    sorting.end();
+  }
+  row_group.number(5, kI64, group.offset);
+  row_group.number(6, kI64, group.compressed_size);
+  row_group.number(7, kI16, ordinal);
+  row_group.end();
+}
+
+void footer(Output &out, const Column *columns, size_t count,
+            const Workspace &workspace, size_t groups, uint64_t rows,
+            const KeyValue *metadata, size_t metadata_count, Codec codec,
+            const char *build) {
   Struct file(out);
   file.number(1, kI32, 1);
   file.list(2, kStruct, count + 1);
@@ -261,48 +442,13 @@ void footer(Output &out, const Column *columns, size_t count, size_t rows,
   root.string(4, "telemetry");
   root.number(5, kI32, count);
   root.end();
-  for (size_t i = 0; i < count; ++i) {
-    Struct leaf(out);
-    leaf.number(1, kI32, static_cast<uint8_t>(columns[i].type));
-    leaf.number(3, kI32, columns[i].valid ? 1 : 0);
-    leaf.string(4, columns[i].name);
-    leaf.end();
-  }
+  for (size_t i = 0; i < count; ++i)
+    schema_element(out, columns[i]);
   file.number(3, kI64, rows);
-  file.list(4, kStruct, rows ? 1 : 0);
-  if (rows) {
-    Struct group(out);
-    group.list(1, kStruct, count);
-    uint64_t total = 0;
-    for (size_t i = 0; i < count; ++i) {
-      const Column &column = columns[i];
-      total += workspace.uncompressed_sizes[i];
-      Struct chunk(out);
-      chunk.number(2, kI64, 0); // metadata lives only in this footer
-      chunk.field(3, kStruct);
-      Struct meta(out);
-      meta.number(1, kI32, static_cast<uint8_t>(column.type));
-      meta.list(2, kI32, 2);
-      out.integer(0); // PLAIN
-      out.integer(3); // RLE
-      meta.list(3, kBinary, 1);
-      out.string(column.name);
-      meta.number(4, kI32, static_cast<uint8_t>(codec));
-      meta.number(5, kI64, rows);
-      meta.number(6, kI64, workspace.uncompressed_sizes[i]);
-      meta.number(7, kI64, workspace.sizes[i]);
-      meta.number(9, kI64, workspace.offsets[i]);
-      meta.field(12, kStruct); // Statistics: null count, no min/max claims
-      Struct stats(out);
-      stats.number(3, kI64, rows - present_count(column, rows));
-      stats.end();
-      meta.end();
-      chunk.end();
-    }
-    group.number(2, kI64, total);
-    group.number(3, kI64, rows);
-    group.end();
-  }
+  file.list(4, kStruct, groups);
+  for (size_t g = 0; g < groups; ++g)
+    row_group_metadata(out, columns, count, workspace.chunks[g],
+                       workspace.groups[g], g, codec);
   if (metadata_count) {
     file.list(5, kStruct, metadata_count);
     for (size_t i = 0; i < metadata_count; ++i) {
@@ -312,7 +458,20 @@ void footer(Output &out, const Column *columns, size_t count, size_t rows,
       kv.end();
     }
   }
-  file.string(6, "m5stack-aq-parquet version 0.1");
+  file.field(6, kBinary);
+  if (build && build[0])
+    out.string(kCreatedBy, " (build ", build, ")");
+  else
+    out.string(kCreatedBy);
+  // Column orders are required for min_value/max_value to be meaningful.
+  file.list(7, kStruct, count);
+  for (size_t i = 0; i < count; ++i) {
+    Struct order(out);
+    order.field(1, kStruct); // TYPE_ORDER
+    Struct type_defined(out);
+    type_defined.end();
+    order.end();
+  }
   file.end();
 }
 
@@ -328,20 +487,25 @@ bool bounded_string(const char *value, size_t limit, bool allow_empty = false) {
 
 } // namespace
 
-Result write_parquet(Sink sink, void *context, const Column *columns,
-                     size_t column_count, size_t row_count,
-                     Workspace &workspace, const KeyValue *metadata,
-                     size_t metadata_count, const Compression *compression) {
+Result Writer::fail(const char *error) {
+  active_ = false;
+  return {false, accepted_, error};
+}
+
+Result Writer::begin(Sink sink, void *context, Workspace &workspace,
+                     const Column *columns, size_t column_count,
+                     const Compression *compression) {
+  active_ = false;
+  groups_ = 0;
+  used_ = 0;
+  rows_ = position_ = accepted_ = 0;
   if (compression &&
       (compression->codec != Codec::Lz4Raw || !compression->raw ||
        !compression->encoded || !compression->compress ||
        compression->encoded_capacity > INT32_MAX))
     return {false, 0, "invalid compression configuration"};
-  if (!sink || !columns || !column_count || column_count > kMaxColumns ||
-      row_count > kMaxRows || metadata_count > 64 ||
-      (metadata_count && !metadata)) {
+  if (!sink || !columns || !column_count || column_count > kMaxColumns)
     return {false, 0, "invalid argument or capacity exceeded"};
-  }
   for (size_t i = 0; i < column_count; ++i) {
     const Column &column = columns[i];
     if (!bounded_string(column.name, 255) ||
@@ -350,49 +514,107 @@ Result write_parquet(Sink sink, void *context, const Column *columns,
          column.type != PhysicalType::Float)) {
       return {false, 0, "invalid column name or type"};
     }
+    if (column.logical != LogicalType::None &&
+        (column.logical != LogicalType::TimestampNanosUtc ||
+         column.type != PhysicalType::Int64))
+      return {false, 0, "logical type does not match physical type"};
     for (size_t j = 0; j < i; ++j) {
       if (!strcmp(column.name, columns[j].name))
         return {false, 0, "duplicate column name"};
     }
-    if (row_count &&
-        (!column.values || column.stride < width(column.type) ||
-         column.stride > SIZE_MAX / row_count ||
-         (column.valid && (!column.valid_stride ||
-                           column.valid_stride > SIZE_MAX / row_count)))) {
-      return {false, 0, "invalid column buffer or stride"};
-    }
-    if (compression && row_count &&
-        payload_size(column, row_count) > compression->raw_capacity)
-      return {false, 0, "compression page capacity exceeded"};
   }
+  sink_ = sink;
+  context_ = context;
+  workspace_ = &workspace;
+  columns_ = columns;
+  column_count_ = column_count;
+  compression_ = compression;
+  active_ = true;
+  // The magic stays in the staging buffer until the first page or the footer
+  // flushes it, so a rejected first row group leaves the sink untouched.
+  Output out(sink_, context_, *workspace_, used_, position_, accepted_);
+  out.bytes("PAR1", 4);
+  return {true, accepted_, nullptr};
+}
+
+Result Writer::row_group(size_t row_count, int sorted_by) {
+  if (!active_)
+    return {false, accepted_, "writer is not active"};
+  if (!row_count || row_count > kMaxRows || groups_ >= kMaxRowGroups ||
+      sorted_by >= static_cast<int>(column_count_))
+    return fail("invalid row count, sort column or row-group capacity");
+  for (size_t i = 0; i < column_count_; ++i) {
+    const Column &column = columns_[i];
+    if (!column.values || column.stride < width(column.type) ||
+        column.stride > SIZE_MAX / row_count ||
+        (column.valid &&
+         (!column.valid_stride || column.valid_stride > SIZE_MAX / row_count)))
+      return fail("invalid column buffer or stride");
+    if (compression_ &&
+        payload_size(column, row_count) > compression_->raw_capacity)
+      return fail("compression page capacity exceeded");
+  }
+  Output out(sink_, context_, *workspace_, used_, position_, accepted_);
+  ChunkRecord *chunks = workspace_->chunks[groups_];
+  GroupRecord &group = workspace_->groups[groups_];
+  group = GroupRecord{row_count, out.position(), 0, 0, sorted_by};
+  for (size_t i = 0; i < column_count_ && out.ok(); ++i) {
+    ChunkRecord &record = chunks[i];
+    statistics(columns_[i], row_count, record);
+    record.offset = out.position();
+    if (!page(out, columns_[i], row_count, *workspace_, compression_, record))
+      return fail("page encoding/compression or sink failed");
+    record.size = out.position() - record.offset;
+    group.compressed_size += record.size;
+    group.uncompressed_size += record.uncompressed_size;
+  }
+  out.flush();
+  if (!out.ok())
+    return fail("sink write failed");
+  ++groups_;
+  rows_ += row_count;
+  return {true, accepted_, nullptr};
+}
+
+Result Writer::finish(const KeyValue *metadata, size_t metadata_count,
+                      const char *build) {
+  if (!active_)
+    return {false, accepted_, "writer is not active"};
+  if (metadata_count > 64 || (metadata_count && !metadata) ||
+      (build && !bounded_string(build, 64, true)))
+    return fail("invalid metadata or build identity");
   for (size_t i = 0; i < metadata_count; ++i) {
     if (!bounded_string(metadata[i].key, 255) ||
-        !bounded_string(metadata[i].value, 4096, true)) {
-      return {false, 0, "invalid metadata key or value"};
-    }
+        !bounded_string(metadata[i].value, 4096, true))
+      return fail("invalid metadata key or value");
   }
-  Output out(sink, context, workspace);
-  out.bytes("PAR1", 4);
-  if (row_count) {
-    for (size_t i = 0; i < column_count && out.ok(); ++i) {
-      workspace.offsets[i] = out.position();
-      if (!page(out, columns[i], row_count, workspace, compression,
-                workspace.uncompressed_sizes[i]))
-        return {false, out.accepted(),
-                "page encoding/compression or sink failed"};
-      workspace.sizes[i] = out.position() - workspace.offsets[i];
-    }
-  }
-  if (!out.ok())
-    return {false, out.accepted(), "sink write failed"};
+  Output out(sink_, context_, *workspace_, used_, position_, accepted_);
   const uint64_t footer_start = out.position();
-  footer(out, columns, column_count, row_count, workspace, metadata,
+  footer(out, columns_, column_count_, *workspace_, groups_, rows_, metadata,
          metadata_count,
-         compression ? compression->codec : Codec::Uncompressed);
+         compression_ ? compression_->codec : Codec::Uncompressed, build);
   out.little_endian(out.position() - footer_start, 4);
   out.bytes("PAR1", 4);
   out.flush();
-  return {out.ok(), out.accepted(), out.ok() ? nullptr : "sink write failed"};
+  active_ = false;
+  return {out.ok(), accepted_, out.ok() ? nullptr : "sink write failed"};
+}
+
+Result write_parquet(Sink sink, void *context, const Column *columns,
+                     size_t column_count, size_t row_count,
+                     Workspace &workspace, const KeyValue *metadata,
+                     size_t metadata_count, const Compression *compression,
+                     int sorted_by, const char *build) {
+  if (row_count > kMaxRows)
+    return {false, 0, "invalid argument or capacity exceeded"};
+  Writer writer;
+  Result result = writer.begin(sink, context, workspace, columns, column_count,
+                               compression);
+  if (result.ok && row_count)
+    result = writer.row_group(row_count, sorted_by);
+  if (result.ok)
+    result = writer.finish(metadata, metadata_count, build);
+  return result;
 }
 
 } // namespace telemetry
