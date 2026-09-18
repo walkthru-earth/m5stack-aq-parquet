@@ -2,15 +2,15 @@
 
 Design note, **source-checked 2026-09-18; implemented the same day in firmware `-v6.3` (advertising payload) and the Android app (companion presence, Wi-Fi arrival); nothing on this page is bench-verified yet** — the flag-scan receiver on the phone is still to write. Load when working on Auto-sync in the Android app (`../m5stack-aq-android`, `docs/background-sync.md`) or on the firmware's BLE advertising. The GATT/LAN contract, including the advertising bytes, is in [ble-sync-protocol](ble-sync-protocol.md#advertising-payload-v21); this page is the reasoning for *when* a sync starts, not *how* files move.
 
-## Where we are
+## The problem this solves
 
-Today the phone **polls**: a WorkManager periodic request every 15 min (the platform minimum, later under Doze) browses mDNS for up to 10 s, tries LAN, then a direct `connectGatt` to the bonded address. The device does nothing to help — it advertises `AQ-xxxx` plus the service UUID and waits. Measured consequences ([bench-verified](bench-verified.md#board-1-phone-over-lan-and-ble)):
+Until 2026-09-18 the phone only **polled**: a WorkManager periodic request every 15 min (the platform minimum, later under Doze) browsed mDNS for up to 10 s, tried LAN, then a direct `connectGatt` to the bonded address. The device did nothing to help — it advertised `AQ-xxxx` plus the service UUID and waited. Measured consequences ([bench-verified](bench-verified.md#board-1-phone-over-lan-and-ble)):
 
-- a file finalizes every 10–60 min and waits up to a period (plus Doze deferral) before the phone learns of it;
-- a rebooted device runs **unsynced** (rows into the `unsynced` tree) until the next poll happens to find it, even with the phone on the desk beside it;
+- a file finalizes every 10–60 min and waited up to a period (plus Doze deferral) before the phone learned of it;
+- a rebooted device ran **unsynced** (rows into the `unsynced` tree) until the next poll happened to find it, even with the phone on the desk beside it;
 - Android destroyed the app's TCP sockets ~2 min after screen-off ("Destroyed live tcp sockets for uids=…"), which is the background-network restriction, not the link; the `dataSync` foreground service is a workaround, and `setForeground` is refused when the worker starts in the background.
 
-Nothing here needs a server; every mechanism below is phone-local and works with no internet, so it stays inside the offline-first rule.
+The periodic request remains as the floor. The three triggers below start a run earlier, and one of them is controlled by the device. Nothing here needs a server; every mechanism is phone-local and works with no internet, so it stays inside the offline-first rule.
 
 ## What Android offers (verified against the API 36/37 SDK jars and AOSP `android16-release`)
 
@@ -24,7 +24,7 @@ Nothing here needs a server; every mechanism below is phone-local and works with
 
 Not viable: a device-initiated TCP/UDP "wake" (Android has nothing that wakes a process on an inbound LAN packet; the phone runs no server), a device SoftAP joined via `WifiNetworkSpecifier` (foreground-only, user dialog) or `WifiNetworkSuggestion` (a network without internet is deprioritised and may be dropped), Wi-Fi Aware (no CoreS3 support). A phone that stays GATT-connected all day would receive `status` notifications, but it stops the device advertising, blocks the laptop and every other phone (one BLE connection), and needs the CDM exemption anyway — not the default.
 
-## Proposed layering
+## Layering (implemented, unverified)
 
 ```mermaid
 flowchart TD
@@ -45,8 +45,8 @@ flowchart TD
     T -. hardware filter match .-> PI
 ```
 
-1. **CDM association** (app only; no firmware change). Turns proximity into an event and, more importantly, buys the background exemptions that the measured socket kills call for. Replace nothing: the periodic request stays as the floor. `EVENT_BLE_APPEARED` → same expedited `SyncWorker` path as "Sync now in background", so all the existing guards (interactive session wins, no pairing, one link at a time) apply. `EVENT_BLE_DISAPPEARED` → no action (the worker's own timeouts handle a device that walked away mid-transfer). Association needs a one-time system dialog; use `setSingleDevice(true)` with a `BluetoothLeDeviceFilter` on the service UUID so it shows one confirm, not a chooser. Associate at first pair; store `associationId` next to the bond in `known_device`.
-2. **Device-flagged wake** (firmware + protocol + app). Advertising service data, below, plus a `PendingIntent` scan whose filters are `deviceAddress = bonded MAC` **and** `serviceData(uuid, 0b01, mask 0b01)` (or `0b10/0b10`; two filters, OR'd). `FIRST_MATCH` fires when the device flips a bit, `MATCH_LOST` re-arms it after the device clears the bit. The receiver checks the counters and enqueues the worker only when `boot`/`fin` differ from what the archive recorded — no connect when nothing changed. Falls back to a plain 15-min poll on a controller without offloaded filtering.
+1. **CDM association** (app only; no firmware change). Turns proximity into an event and, more importantly, buys the background exemptions that the measured socket kills call for. Replaces nothing: the periodic request stays as the floor. `EVENT_BLE_APPEARED` → same expedited `SyncWorker` path as "Sync now in background", so all the existing guards (interactive session wins, no pairing, one link at a time) apply. `EVENT_BLE_DISAPPEARED` → no action (the worker's own timeouts handle a device that walked away mid-transfer). Association needs a one-time system dialog; use `setSingleDevice(true)` with a `BluetoothLeDeviceFilter` on the service UUID so it shows one confirm, not a chooser. Associate at first pair; store `associationId` next to the bond in `known_device`.
+2. **Device-flagged wake** (firmware + protocol + app). Advertising service data, below, plus a `PendingIntent` scan whose filters are `deviceAddress = bonded MAC` **and** `serviceData(uuid, [0, 0x02], mask [0, 0x02])` for `new_files` (and `[0, 0x01]` for `no_utc`; two filters per device, OR'd). `FIRST_MATCH` fires when the device flips a bit, `MATCH_LOST` re-arms it after the device clears the bit. The receiver de-duplicates on `boot16:fin:flags` and enqueues the worker only for a new key — no connect when nothing changed. Absent on a controller without offloaded filtering; the poll floor and the presence trigger remain.
 3. **Wi-Fi arrival** (app only). Cheap "came home" trigger for the LAN path; bounded by the existing 10 s mDNS browse.
 
 ## Firmware: what actually helps
