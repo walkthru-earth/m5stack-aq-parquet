@@ -2,7 +2,7 @@
 
 **Status: active. Real-sensor Parquet SD logging, full 60/90-row uncompressed files, UTC Hive checks and identical-row LZ4 compression comparisons were verified on hardware on 2026-09-08. Bluetooth LE file sync (`arduino-cores3-parquet-v4`) was flashed and verified from a host BLE client on 2026-09-16; protocol v2 with Wi-Fi/LAN sync (`-v5`) on 2026-09-17; file schema v3 with multi-row-group files, statistics and TIMESTAMP annotations (`-v6`, then the `-v6.1` lifetime fix) flashed and read back the same day.**
 
-## Work in progress (last verified 2026-09-17, resume here)
+## Work in progress (last verified 2026-09-18, resume here)
 
 `arduino-cores3-parquet-v5` — protocol **v2** ([contract](../../docs/ble-sync-protocol.md)): device configuration, pairing modes, Wi-Fi provisioning, LAN sync server. Was on the board until 12:41 on 2026-09-17 (superseded by `-v6` below, which keeps all of it), binary SHA-256 `6144ea1d…`, retained at `artifacts/firmware/cores3-parquet-v5-6144ea1d.bin` (previous: `d5f1db40…`, same directory). 1,408,487 program bytes / 78,628 static RAM. The board is provisioned to the owner's home Wi-Fi (credentials live only in the board's NVS). `pixi run fmt-check`, `pixi run lint` and `pixi run python tools/test_ble_sync.py` pass. Bench detail: [bench record](../../docs/bench-verified.md#board-1-protocol-v2-configuration-wi-fi-lan-sync-phone).
 
@@ -20,7 +20,7 @@
 
 Next: one uninterrupted full-card run for a clean timing number, a scheduled auto-sync with the app closed, `ble.clear_bonds` / `lan.rotate_token` from the app, `fixed`/`none` pairing on a display-less board, then commit this repo (the Android repo is committed).
 
-### Source 2026-09-18, not yet flashed: `arduino-cores3-parquet-v6.2`, RTC hand-off
+### Flashed 2026-09-18 07:00Z: `arduino-cores3-parquet-v6.2`, RTC hand-off
 
 Motivation: the BM8563 at `0x51` had never been written, so every "RTC read failed" since 2026-09-08 was an unset chip, and every reboot filled `unsynced/` until a phone or the host sent `SET_TIME` (see [hardware](../../docs/cores3-hardware.md), "BM8563 RTC"). v6.2 keeps the clock contract (anchor = host UTC seconds paired with a monotonic instant; no fabricated UTC; old rows never rewritten) and adds a second, weaker source for that anchor:
 
@@ -32,7 +32,7 @@ Motivation: the BM8563 at `0x51` had never been written, so every "RTC read fail
 | `status` JSON adds `clk` (anchor source 0/1/2) and `rtc` (chip state 0 unread / 1 in use / 2 unusable); footer `clock` metadata documents code 2; `kFirmware` → `-v6.2` | the phone should offer "set time" when `clk != 1`, not only when `utc == 0` ([protocol](../../docs/ble-sync-protocol.md)) |
 | Device-health page shows `Clock: 2026-09-18 09:42:35Z host e1` (UTC, source, epoch) or `Clock: no UTC yet (RTC unset\|unusable)` | the device never renders local time; time zones are the reader's job |
 
-Host-verified: `pixi run telemetry-contract-test --sanitize` (fixture asserts code 2 and the no-anchor case), `pixi run parquet-test --sanitize`, `fmt-check`, `lint`, `arduino-build` (1,415,975 program bytes / 86,852 static RAM). Schema stays v3 and the dictionary SHA-256 is unchanged (`telemetry_fields.inc` untouched; only the meaning table of the `clock_status` code column grew). Not measured yet: the RTC write/read-back on the board, a dated boot, retention across a full power-off, and the skew of an RTC-restored clock after hours — listed in the bench file's open items.
+Host-verified: `pixi run telemetry-contract-test --sanitize` (fixture asserts code 2 and the no-anchor case), `pixi run parquet-test --sanitize`, `fmt-check`, `lint`, `arduino-build` (1,415,975 program bytes / 86,852 static RAM). Schema stays v3 and the dictionary SHA-256 is unchanged (`telemetry_fields.inc` untouched; only the meaning table of the `clock_status` code column grew). **Flashed and bench-tested the same morning**: image SHA-256 `ad72b96f…`, retained at `artifacts/firmware/cores3-parquet-v6.2-ad72b96f.bin`. First boot showed the unset chip (`state=unusable reason=voltage-low`), the first `sync-time` wrote it (`write=ok … late_ms=0`), a LAN `REBOOT` came back dated (`source=rtc` 1.77 s after reset) and produced `data_0700_1d3590e1…_0-2-0.parquet` in the dated tree with `clock_status=2` and the first non-null `rtc_*` columns on this board; a second host sync measured `skew_ms=-513` (resolution-bound). Retained copy in `artifacts/rtc-v6.2/`. Full power-off retention and multi-hour drift remain unmeasured — see the [bench record](../../docs/bench-verified.md#board-1-rtc-hand-off-host-anchor--bm8563--next-boot-firmware-v62).
 
 ### Flashed 2026-09-17 12:41 local: `arduino-cores3-parquet-v6`, file schema v3
 
@@ -232,4 +232,4 @@ On macOS run these from Terminal.app: CoreBluetooth aborts clients launched from
 
 The original 16 MB UIFlow image is preserved under `backup/`. `pixi run restore backup/<file>.bin` writes it back and is destructive, so name the image explicitly. Never write eFuses or raise the esptool baud on this board.
 
-**Last verified on hardware: 2026-09-17, board MAC ending `6b:40` (`arduino-cores3-parquet-v6`: two-row-group schema-v3 files at 1800 s, phone LAN pull; `-v5` LAN/Wi-Fi sync the same day).**
+**Last verified on hardware: 2026-09-18, board MAC ending `6b:40` (`arduino-cores3-parquet-v6.2`: RTC write, RTC-restored dated boot, skew log; 2026-09-17: `-v6` two-row-group schema-v3 files at 1800 s, phone LAN pull; `-v5` LAN/Wi-Fi sync).**
