@@ -34,7 +34,8 @@ Trial directory names state the framework first, for example `firmware/idf-cpp/`
 | Wiring, GPIO ownership, onboard peripherals, power, sleep, boot | `docs/cores3-hardware.md` |
 | Toolchain, framework choice, library versions, memory, driver ownership | `docs/cores3-development.md` |
 | Wi-Fi, BLE, ESP-NOW, channels, coexistence | `docs/cores3-wireless.md` |
-| Phone sync over BLE or LAN: GATT service, frame layout, pairing modes, device configuration, Wi-Fi/TCP/mDNS transport, token, file transfer rules | `docs/ble-sync-protocol.md` |
+| Phone sync over BLE or LAN: GATT service, frame layout, pairing modes, device configuration, Wi-Fi/TCP/mDNS transport, token, file transfer rules, advertising payload | `docs/ble-sync-protocol.md` |
+| When a phone's background sync should start: companion-device presence, offloaded advertising-flag scans, Wi-Fi arrival, what the firmware advertises to wake the phone | `docs/background-sync-triggers.md` |
 | microSD, shared SPI bus, logging, power-loss recovery | `docs/cores3-storage.md` |
 | Measurement schema, Parquet, Hive partitions, clocks, future upload | `docs/telemetry-pipeline.md` |
 | Versioned dictionary, OGC semantics, static Iceberg and workflow diagrams | `docs/table-and-observation-model.md` |

@@ -95,6 +95,10 @@ std::atomic<std::uint32_t> partials_seen{0};
 // Rows/row groups already on the card in the open .partial (footer pending).
 std::atomic<std::uint32_t> open_rows{0}, open_groups{0};
 std::atomic<bool> worker_failed{false}, storage_ok{false};
+// Advertising bit `new_files`: set when a file finalizes, cleared when a LIST
+// has been answered on any link (that phone now knows; a phone that then fails
+// its download is covered by its periodic run). docs/ble-sync-protocol.md.
+std::atomic<bool> unlisted_files{false};
 std::int64_t boot_hi = 0, boot_lo = 0, device = 0, next_sample_us = 0;
 std::int64_t sample_sequence = 0;
 std::atomic<std::int64_t> missed_deadlines{0};
@@ -510,6 +514,7 @@ bool finalize_file(OutputFile &target) {
     return false;
   }
   ++finalized;
+  unlisted_files = true;
   aqlog.printf(
       "PARQUET READY name=%s-%lld-%lu.parquet rows=%u row_groups=%u "
       "first=%lld last=%lld bytes=%lu crc32=%08lx write_us=%lu sync_us=%llu "
@@ -923,6 +928,31 @@ std::size_t build_status_json(char *out, std::size_t size) {
   return written > 0 && std::size_t(written) < size ? std::size_t(written) : 0;
 }
 
+// The ten advertising bytes are derived from the same state as `status`; the
+// BLE side only issues an HCI command when flags or the counter changed.
+void publish_advert() {
+  std::int32_t generation, source;
+  portENTER_CRITICAL(&clock_mutex);
+  generation = clock_generation;
+  source = clock_source;
+  portEXIT_CRITICAL(&clock_mutex);
+  ble::AdvertState advert;
+  advert.finalized = finalized.load();
+  if (!generation)
+    advert.flags |= ble::kAdvNoUtc;
+  else if (source == kClockRtc)
+    advert.flags |= ble::kAdvClockRestored;
+  if (unlisted_files.load())
+    advert.flags |= ble::kAdvNewFiles;
+  if (storage_ok.load())
+    advert.flags |= ble::kAdvSd;
+  if (lan::status().mdns)
+    advert.flags |= ble::kAdvLan;
+  if (worker_failed.load())
+    advert.flags |= ble::kAdvFail;
+  ble::publish_advert(advert);
+}
+
 void publish_status() {
   char json[ble::kMaxJson + 16];
   const std::size_t length = build_status_json(json, sizeof(json));
@@ -930,6 +960,7 @@ void publish_status() {
     ble::publish_status(json, length);
     lan::publish_status(json, length);
   }
+  publish_advert();
 }
 
 // Builds the `live` snapshot from the row that was just queued. Keys are
@@ -1123,6 +1154,8 @@ void ble_list() {
   put_u32(frame + 5, total_kib.load());
   put_u32(frame + 9, used_kib.load());
   respond(frame, sizeof(frame));
+  unlisted_files = false;
+  publish_advert();
 }
 
 void ble_open(const std::uint8_t *name_bytes, std::size_t name_length) {

@@ -1,8 +1,8 @@
 # Sync protocol: device ↔ phone over BLE and LAN
 
-Load when implementing or debugging the Bluetooth LE service, the Wi-Fi/TCP server, or a phone client. Protocol version **2**, defined 2026-09-17; version 1 (2026-09-16, BLE file sync only) is a strict subset, so a v1 phone keeps working against a v2 device. Implemented in the Arduino trial; see [bench-verified](bench-verified.md#board-1-bluetooth-le-sync) for exactly what was measured and on which phone. Radio constraints live in [wireless](cores3-wireless.md); the file/row contract in [telemetry-pipeline](telemetry-pipeline.md).
+Load when implementing or debugging the Bluetooth LE service, the Wi-Fi/TCP server, or a phone client. Protocol version **2**, defined 2026-09-17; version 1 (2026-09-16, BLE file sync only) is a strict subset, so a v1 phone keeps working against a v2 device. Revision **2.1** (2026-09-18, firmware `-v6.3`) adds the [advertising payload](#advertising-payload-v21) and moves the UUID list to the scan response; `info.proto` stays 2 because nothing a connected phone sees changed. Implemented in the Arduino trial; see [bench-verified](bench-verified.md#board-1-bluetooth-le-sync) for exactly what was measured and on which phone. Radio constraints live in [wireless](cores3-wireless.md); the file/row contract in [telemetry-pipeline](telemetry-pipeline.md).
 
-Version 2 adds, on top of the v1 file sync: **device configuration and control** (`GET_CONFIG`/`SET_CONFIG`, Wi-Fi scan and provisioning, reboot, log tail), **pairing modes** for devices without a screen, and a **LAN transport** — the same frames over one TCP socket, discovered with mDNS, authenticated with a token the phone can only obtain over the bonded BLE link. BLE introduces, LAN accelerates.
+Version 2 adds, on top of the v1 file sync: **device configuration and control** (`GET_CONFIG`/`SET_CONFIG`, Wi-Fi scan and provisioning, reboot, log tail), **pairing modes** for devices without a screen, and a **LAN transport** — the same frames over one TCP socket, discovered with mDNS, authenticated with a token the phone can only obtain over the bonded BLE link. BLE introduces, LAN accelerates. Revision 2.1 adds a way for the device to tell a phone that is *not* connected that something changed; why and how a phone uses it is in [background-sync-triggers](background-sync-triggers.md).
 
 ## Purpose and non-goals
 
@@ -21,7 +21,7 @@ The device **never** deletes, rewrites or renames a file because of the phone. S
 | Item | Value |
 | --- | --- |
 | Role | Device = GATT server / peripheral. Phone = central. One connection at a time. |
-| Advertising | Connectable, complete 128-bit service UUID below, local name `AQ-xxxx` (`xxxx` = last four hex digits of `device_id`). |
+| Advertising | Connectable, legacy PDUs, public address (the ESP32-S3 factory MAC, the same bytes `device_id` is built from — never a resolvable private address, see [address stability](#advertising-payload-v21)). **ADV**: flags + 10-byte [service data](#advertising-payload-v21) under the service UUID (31 bytes exactly). **Scan response**: complete local name `AQ-xxxx` (`xxxx` = last four hex digits of `device_id`) + complete 128-bit service UUID list. Before 2.1 the UUID list was in the ADV and there was no service data; Android, CoreBluetooth and bleak all merge both PDUs into one record, so a UUID filter finds the device either way. |
 | MTU | Device accepts up to 517. Phone MUST request ≥ 247 before using `control`. Frame sizes derive from the negotiated MTU: `payload_max = min(MTU − 3, 512)`. The 512 cap is the GATT attribute-value limit; Android silently drops notifications above it (measured 2026-09-17), macOS does not, so a device that sends 514-byte frames works from a laptop and fails from a phone. |
 | Security | LE Secure Connections, bonding. Pairing mode is configurable (below); the default is chosen at first boot from whether a display is present, the way Meshtastic does it. In `random` and `fixed` modes every characteristic requires an encrypted **and authenticated** link (MITM); in `none` mode encrypted only. After the first bond, reconnects are silent. Unbonding is done on the phone, or with `ble.clear_bonds`; the device keeps up to 3 bonds and evicts the oldest. |
 | Endianness | Every multi-byte integer is **little-endian**. |
@@ -36,6 +36,22 @@ The device **never** deletes, rewrites or renames a file because of the phone. S
 | `none` | Just Works | never by default | Encrypted, unauthenticated, no prompt. For lab benches only; must be enabled deliberately. Characteristics drop the `AUTHEN` requirement in this mode so reads succeed. |
 
 The mode and PIN are stored in NVS (`aqcfg` namespace) and are **applied at the next boot**, because the NimBLE security parameters are fixed at stack start; `SET_CONFIG` answers with `reboot_required` set and the phone offers `REBOOT`. The first-boot auto-detection result is stored, so removing the display later does not silently change the mode (again like Meshtastic — change the mode before removing the screen). A lost phone is handled by re-pairing or by `ble.clear_bonds=1`.
+
+### Advertising payload (v2.1)
+
+Service data AD (type `0x21`) under the service UUID `c0a5e9f0-0001-…`, in the ADV PDU, refreshed in place (one HCI command) whenever a field changes — at most once per sample tick, in practice a few times per file window. A phone never has to connect to learn any of it, and a phone's offloaded scan filter (`deviceAddress` **and** `serviceData` with a mask on byte 1) can wake its app on a bit flip while it sleeps. Everything here is public to anyone in range: presence, counters, health bits — nothing more.
+
+| Offset | Field | Meaning |
+| --- | --- | --- |
+| 0 | `ver` u8 | payload version, **1**; a phone ignores payloads with another version |
+| 1 | `flags` u8 | bit 0 `no_utc` — no UTC anchor this boot (`status.utc == 0`): rows are landing in the `unsynced` tree, a phone in range should send `SET_TIME` now · bit 1 `new_files` — a file finalized since the last `LIST` answered on any link · bit 2 `sd` (`status.sd`) · bit 3 `lan` — Wi-Fi connected and the mDNS/TCP server up, so a woken phone knows whether the LAN browse is worth its 10 s · bit 4 `fail` (`status.fail`) · bit 5 `clk_restored` — `status.clk == 2`, dated from the RTC only, a time refresh is welcome but not urgent · bits 6–7 reserved, 0 |
+| 2–5 | `fin` u32 | `status.fin`, files finalized this boot |
+| 6–7 | `boot16` u16 | the last four hex digits of `info.boot`, so a phone notices a reboot (`fin` restarts at 0) |
+| 8–9 | reserved | 0. **Never an IP address or port**: advertisements are unauthenticated, and a forged one would send the phone's LAN token to an attacker's socket. Discovery stays mDNS |
+
+Rules: `new_files` is set when a window closes or a `FLUSH` finalizes a file and cleared when a `LIST` has been answered on any link (that phone now knows the file exists; a phone that then fails its download is covered by its own periodic run). `no_utc` and `clk_restored` are mutually exclusive; both clear after a host `SET_TIME`. The interval stays NimBLE's default fast connectable interval (30–60 ms), which sets a low-power scanner's detection latency; if it is ever slowed, keep it ≤ 200 ms for a minute after a flag flips. `pixi run ble-sync scan` prints the decoded payload (`adv_ver= flags= fin= boot16=`).
+
+**Address stability.** Both the Android Companion Device Manager and per-device scan filters key on the advertised address. NimBLE uses the public address derived from the factory MAC; do not enable NimBLE privacy / resolvable private addresses on this device — every presence mechanism would silently stop matching.
 
 ## Service and characteristics
 
@@ -268,4 +284,4 @@ Local archive identity is `(station, relative name)`; the file is immutable so `
 
 ## Still to measure
 
-Throughput and energy of a full sync over BLE and over LAN, notification-drop and sampling-jitter behaviour with Wi-Fi **on** (coexistence), heap headroom with BLE + Wi-Fi + mDNS + TCP all active, `fixed`/`none` pairing on a display-less board (only simulated on the CoreS3 so far), and bonded-reconnect latency. Record results in [bench-verified](bench-verified.md) with firmware hash and phone model.
+The 2.1 advertisement on a phone: that an interactive scan still finds the device with the UUID list in the scan response, that the OnePlus 7 Pro's controller matches a service-data mask in an offloaded (`PendingIntent`) filter, and the flag-flip → app-wake latency. Throughput and energy of a full sync over BLE and over LAN, notification-drop and sampling-jitter behaviour with Wi-Fi **on** (coexistence), heap headroom with BLE + Wi-Fi + mDNS + TCP all active, `fixed`/`none` pairing on a display-less board (only simulated on the CoreS3 so far), and bonded-reconnect latency. Record results in [bench-verified](bench-verified.md) with firmware hash and phone model.

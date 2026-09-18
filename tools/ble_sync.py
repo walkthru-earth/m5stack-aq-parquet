@@ -407,17 +407,40 @@ async def connect(args):
     return client, session
 
 
+ADVERT_FLAGS = ["no_utc", "new_files", "sd", "lan", "fail", "clk_restored"]
+
+
+def decode_advert(payload):
+    """Advertising service data, protocol v2.1 (docs/ble-sync-protocol.md, 'Advertising payload').
+
+    Ten little-endian bytes under the service UUID: version, flags, fin u32, boot16 u16, two spare.
+    Returns a dict, or None for an unknown version / short payload (a pre-v2.1 device has none)."""
+    if payload is None or len(payload) < 8 or payload[0] != 1:
+        return None
+    flags = payload[1]
+    return {
+        "ver": payload[0],
+        "flags": [name for bit, name in enumerate(ADVERT_FLAGS) if flags & (1 << bit)],
+        "fin": int.from_bytes(payload[2:6], "little"),
+        "boot16": f"{int.from_bytes(payload[6:8], 'little'):04x}",
+    }
+
+
 async def cmd_scan(args):
     seen = {}
 
     def on_adv(d, ad):
-        if SERVICE in [u.lower() for u in ad.service_uuids]:
-            seen[d.address] = (d.name, ad.rssi)
+        advert = decode_advert(ad.service_data.get(SERVICE))
+        if SERVICE in [u.lower() for u in ad.service_uuids] or advert is not None:
+            seen[d.address] = (d.name, ad.rssi, advert)
 
     async with BleakScanner(on_adv):
         await asyncio.sleep(args.seconds)
-    for address, (name, rssi) in seen.items():
-        print(f"BLE DEVICE name={name} address={address} rssi={rssi}")
+    for address, (name, rssi, advert) in seen.items():
+        extra = ""
+        if advert is not None:
+            extra = f" adv_ver={advert['ver']} flags={','.join(advert['flags']) or '-'} fin={advert['fin']} boot16={advert['boot16']}"
+        print(f"BLE DEVICE name={name} address={address} rssi={rssi}{extra}")
     print(f"BLE SCAN END devices={len(seen)}")
 
 

@@ -11,6 +11,7 @@
 
 #include <atomic>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 
 namespace ble {
@@ -42,6 +43,46 @@ std::atomic<std::uint32_t> passkey{0}, bonds{0}, generation{0}, ui{0};
 std::atomic<std::int64_t> pairing_deadline{0};
 config::PairMode mode = config::PairMode::Random;
 std::uint32_t fixed_passkey = config::kDefaultPin;
+// Advertising service data: flags in bits 0-7, finalized counter in bits 8-39.
+// One word so two tasks racing on publish_advert() cannot tear the pair.
+std::atomic<std::uint64_t> advert_word{~0ULL};
+std::uint16_t boot16 = 0;
+NimBLEAdvertising *advertiser = nullptr;
+
+std::uint64_t pack_advert(const AdvertState &state) {
+  return static_cast<std::uint64_t>(state.flags) |
+         (static_cast<std::uint64_t>(state.finalized) << 8);
+}
+
+void fill_advert_payload(std::uint8_t *out, const AdvertState &state) {
+  out[0] = kAdvertVersion;
+  out[1] = state.flags;
+  out[2] = static_cast<std::uint8_t>(state.finalized);
+  out[3] = static_cast<std::uint8_t>(state.finalized >> 8);
+  out[4] = static_cast<std::uint8_t>(state.finalized >> 16);
+  out[5] = static_cast<std::uint8_t>(state.finalized >> 24);
+  out[6] = static_cast<std::uint8_t>(boot16);
+  out[7] = static_cast<std::uint8_t>(boot16 >> 8);
+  out[8] = 0;
+  out[9] = 0;
+}
+
+// ADV PDU: flags (3) + service data (2 + 16 + 10) = 31 bytes exactly. The
+// local name and the complete 128-bit UUID list go in the scan response
+// (9 + 18 = 27 bytes); Android and bleak merge both into one record, and the
+// offloaded filters run over each frame (APCF spec), so a service-UUID filter
+// still finds the device and a service-data filter sees the flags.
+bool apply_advert_data(const AdvertState &state) {
+  if (!advertiser)
+    return false;
+  std::uint8_t payload[kAdvertPayloadBytes];
+  fill_advert_payload(payload, state);
+  NimBLEAdvertisementData adv;
+  adv.setFlags(BLE_HS_ADV_F_DISC_GEN | BLE_HS_ADV_F_BREDR_UNSUP);
+  if (!adv.setServiceData(NimBLEUUID(kServiceUuid), payload, sizeof(payload)))
+    return false;
+  return advertiser->setAdvertisementData(adv);
+}
 
 void touch_ui() { ++ui; }
 
@@ -220,10 +261,31 @@ bool begin(const Identity &identity, config::PairMode pairing_mode,
     return false;
   }
 
-  NimBLEAdvertising *advertiser = NimBLEDevice::getAdvertising();
-  advertiser->setName(name_text);
-  advertiser->addServiceUUID(kServiceUuid);
+  // The last four hex digits of the boot id travel in the advertisement so a
+  // phone sees a reboot (the finalized counter restarts) without connecting.
+  {
+    const std::size_t boot_length = std::strlen(identity.boot);
+    const char *tail =
+        boot_length >= 4 ? identity.boot + boot_length - 4 : identity.boot;
+    boot16 = static_cast<std::uint16_t>(std::strtoul(tail, nullptr, 16));
+  }
+
+  advertiser = NimBLEDevice::getAdvertising();
   advertiser->enableScanResponse(true);
+  AdvertState initial;
+  initial.flags = kAdvNoUtc; // refined by the first publish_advert()
+  if (!apply_advert_data(initial)) {
+    aqlog.println("BLE ERROR operation=advert-data");
+    return false;
+  }
+  advert_word = pack_advert(initial);
+  NimBLEAdvertisementData scan_response;
+  scan_response.setName(name_text);
+  scan_response.setCompleteServices(NimBLEUUID(kServiceUuid));
+  if (!advertiser->setScanResponseData(scan_response)) {
+    aqlog.println("BLE ERROR operation=scan-response-data");
+    return false;
+  }
   if (!advertiser->start()) {
     aqlog.println("BLE ERROR operation=advertise");
     return false;
@@ -231,10 +293,12 @@ bool begin(const Identity &identity, config::PairMode pairing_mode,
   enabled = true;
   advertising = true;
   touch_ui();
-  aqlog.printf("BLE BEGIN name=%s service=%s mtu_max=%u bonds=%lu pair=%s\n",
+  aqlog.printf("BLE BEGIN name=%s service=%s mtu_max=%u bonds=%lu pair=%s "
+               "adv_ver=%u boot16=%04x\n",
                name_text, kServiceUuid, unsigned(kMaxMtu),
                static_cast<unsigned long>(bonds.load()),
-               config::pair_name(mode));
+               config::pair_name(mode), unsigned(kAdvertVersion),
+               unsigned(boot16));
   return true;
 }
 
@@ -266,6 +330,24 @@ void publish_status(const char *json, std::size_t length) {
   if (connected.load() && authenticated.load())
     status_char->notify(reinterpret_cast<const std::uint8_t *>(json), length,
                         conn_handle.load());
+}
+
+void publish_advert(const AdvertState &state) {
+  if (!enabled.load())
+    return;
+  const std::uint64_t next = pack_advert(state);
+  const std::uint64_t previous = advert_word.exchange(next);
+  if (previous == next)
+    return;
+  // Legacy advertising data may be replaced while advertising (and while
+  // connected, for the restart on disconnect); NimBLE issues one HCI command.
+  if (!apply_advert_data(state)) {
+    aqlog.println("BLE ERROR operation=advert-refresh");
+    return;
+  }
+  touch_ui();
+  aqlog.printf("BLE ADV flags=0x%02x fin=%lu\n", unsigned(state.flags),
+               static_cast<unsigned long>(state.finalized));
 }
 
 bool send_response(const std::uint8_t *frame, std::size_t length) {
@@ -313,6 +395,7 @@ LinkState link() {
   state.authenticated = authenticated.load();
   state.mtu = mtu.load();
   state.bonds = bonds.load();
+  state.advert_flags = static_cast<std::uint8_t>(advert_word.load() & 0xffU);
   return state;
 }
 

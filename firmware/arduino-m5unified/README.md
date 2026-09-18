@@ -4,6 +4,10 @@
 
 ## Work in progress (last verified 2026-09-18, resume here)
 
+### Built, not flashed: `arduino-cores3-parquet-v6.3`, advertising payload (protocol 2.1)
+
+The device now tells a phone that is *not* connected that something changed: ten bytes of service data under the service UUID in the ADV PDU (`ver`, flags `no_utc`/`new_files`/`sd`/`lan`/`fail`/`clk_restored`, `fin` u32, `boot16`), refreshed in place with one HCI command when a field changes; the local name and the 128-bit UUID list moved to the scan response because the ADV is now exactly 31 bytes. `new_files` is set at `PARQUET READY` and cleared after a `LIST` on any link. Contract: [advertising payload](../../docs/ble-sync-protocol.md#advertising-payload-v21); reasoning and the Android side: [background-sync-triggers](../../docs/background-sync-triggers.md). Host-verified only: `arduino-build` (1,417,339 program bytes / 86,868 static RAM), `fmt-check`, `lint`; `pixi run ble-sync scan` decodes the payload. **Verify on the phone before trusting it**: the interactive scan must still find the device (UUID list now in the scan response), and `BLE ADV flags=… fin=…` lines should appear on serial at boot, at each file and after a LIST.
+
 `arduino-cores3-parquet-v5` — protocol **v2** ([contract](../../docs/ble-sync-protocol.md)): device configuration, pairing modes, Wi-Fi provisioning, LAN sync server. Was on the board until 12:41 on 2026-09-17 (superseded by `-v6` below, which keeps all of it), binary SHA-256 `6144ea1d…`, retained at `artifacts/firmware/cores3-parquet-v5-6144ea1d.bin` (previous: `d5f1db40…`, same directory). 1,408,487 program bytes / 78,628 static RAM. The board is provisioned to the owner's home Wi-Fi (credentials live only in the board's NVS). `pixi run fmt-check`, `pixi run lint` and `pixi run python tools/test_ble_sync.py` pass. Bench detail: [bench record](../../docs/bench-verified.md#board-1-protocol-v2-configuration-wi-fi-lan-sync-phone).
 
 | Piece | State |

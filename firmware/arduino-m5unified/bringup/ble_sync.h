@@ -76,6 +76,25 @@ enum Error : std::uint8_t {
   kErrWifiUnavailable = 15,
 };
 
+// Advertising service data (protocol v2.1, docs/ble-sync-protocol.md
+// "Advertising payload"). Ten bytes under the service UUID in the ADV PDU so a
+// phone's offloaded scan filter can wake its app on a flag bit; the name and
+// the 128-bit UUID list ride in the scan response. Little-endian.
+constexpr std::uint8_t kAdvertVersion = 1;
+constexpr std::size_t kAdvertPayloadBytes = 10;
+enum AdvertFlag : std::uint8_t {
+  kAdvNoUtc = 1U << 0,         // no UTC anchor this boot: rows go to `unsynced`
+  kAdvNewFiles = 1U << 1,      // a file finalized since the last completed LIST
+  kAdvSd = 1U << 2,            // card mounted, output directory exists
+  kAdvLan = 1U << 3,           // Wi-Fi connected and the LAN server is up
+  kAdvFail = 1U << 4,          // storage worker stopped after an error
+  kAdvClockRestored = 1U << 5, // clock_status == 2: dated from the RTC only
+};
+struct AdvertState {
+  std::uint8_t flags = 0;
+  std::uint32_t finalized = 0; // same counter as status.fin
+};
+
 // Which transport a control request arrived on. The storage worker answers on
 // the same link (ble::send_response or lan::send_response) and a file handle
 // is only honoured on the link that opened it.
@@ -112,6 +131,7 @@ struct LinkState {
   bool authenticated = false;
   std::uint16_t mtu = 0;
   std::uint32_t bonds = 0;
+  std::uint8_t advert_flags = 0; // last advertised AdvertFlag bits
 };
 
 // Call once after telemetry::begin_logger() and config::load(); identities
@@ -129,6 +149,10 @@ void clear_bonds();
 // From the sampling loop, after the row was queued. Payloads <= kMaxJson.
 void publish_live(const char *json, std::size_t length);
 void publish_status(const char *json, std::size_t length);
+// Alongside publish_status(): refreshes the advertising service data when the
+// flags or the finalized-file counter changed (one HCI command), otherwise a
+// compare. Safe from any task; a no-op until begin() succeeded.
+void publish_advert(const AdvertState &state);
 
 // From the storage worker. Blocks briefly on host back-pressure; false when
 // the peer is gone or the host kept refusing the notification.

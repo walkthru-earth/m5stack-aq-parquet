@@ -13,6 +13,7 @@ Current result: the [active Arduino trial](../firmware/arduino-m5unified/README.
 | Wi-Fi, Bluetooth LE, ESP-NOW, channels and coexistence | [Wireless](cores3-wireless.md) |
 | Built-in microSD slot, shared SPI, logging, removal/recovery | [Storage](cores3-storage.md) |
 | Phone sync over Bluetooth LE or LAN: GATT service, frames, pairing modes, device configuration, Wi-Fi/TCP/mDNS transport, file transfer contract | [Sync protocol](ble-sync-protocol.md) |
+| When a background sync should start: Android companion-device presence, offloaded BLE scans, Wi-Fi arrival, and the advertising payload the device could use to wake the phone (proposal, not implemented) | [Background sync triggers](background-sync-triggers.md) |
 | Sensor validity, station identity, clock epochs, Parquet, Hive and future ingestion | [Telemetry pipeline](telemetry-pipeline.md) |
 | Static Iceberg, SensorThings V2 draft, observation mapping and versioned provenance | [Table and observation model](table-and-observation-model.md) |
 | Build/flash, runtime interval/time commands, USB fetch and query examples | [Active trial usage](../firmware/arduino-m5unified/README.md) |
