@@ -72,6 +72,17 @@ int main(int argc, char **argv) {
   assert(corrected.data[clock_epoch] == 2);
   assert(corrected.data[event_time_utc_ns] == 1788889005000000000LL);
   assert(rows[1].data[event_time_utc_ns] == old_utc);
+  // An RTC-restored anchor is dated like a host one but carries code 2; with
+  // no anchor the source code is ignored and the status stays 0.
+  Sample restored{}, unanchored{};
+  apply_clock(restored, 30000000, 25000000, 1788889000000000000LL, 1,
+              kClockRtc);
+  assert(restored.data[clock_status] == kClockRtc);
+  assert(restored.data[clock_epoch] == 1);
+  assert(restored.data[event_time_utc_ns] == 1788889005000000000LL);
+  apply_clock(unanchored, 30000000, 0, 0, 0, kClockRtc);
+  assert(unanchored.data[clock_status] == kClockNone);
+  assert(!unanchored.valid[event_time_utc_ns]);
   prepare_columns(columns, rows);
   const KeyValue metadata[] = {{"schema_version", kSchemaName},
                                {"firmware", kFirmware},

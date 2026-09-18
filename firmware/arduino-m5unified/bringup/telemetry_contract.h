@@ -16,7 +16,7 @@ namespace contract {
 constexpr std::int32_t kSchemaVersion = 3;
 constexpr const char *kSchemaName = "cores3-telemetry-v3";
 constexpr const char *kDictionaryVersion = "cores3-telemetry-v2";
-constexpr const char *kFirmware = "arduino-cores3-parquet-v6.1";
+constexpr const char *kFirmware = "arduino-cores3-parquet-v6.2";
 constexpr const char *kDictionaryUri =
     "https://github.com/walkthru-earth/m5stack-aq-parquet/blob/main/"
     "firmware/arduino-m5unified/bringup/telemetry_fields.inc";
@@ -92,11 +92,26 @@ inline void prepare_columns(Column *columns, Sample *rows) {
                logical_type(kFields[i])};
 }
 
+// `clock_status` codes. The anchor is always "host UTC seconds paired with a
+// device monotonic instant"; the code says where that pairing came from.
+//   0  no anchor: UTC fields null, rows go to the `unsynced` tree
+//   1  host estimate supplied on this boot (serial `parquet time`, BLE/LAN
+//      SET_TIME); the same value is written to the BM8563 RTC
+//   2  restored at boot from the BM8563 RTC, which only ever holds a value a
+//      host supplied earlier (whole seconds, so up to 1 s coarser, plus RTC
+//      drift since that sync); a later host sync starts a new epoch
+enum ClockSource : std::int32_t {
+  kClockNone = 0,
+  kClockHost = 1,
+  kClockRtc = 2,
+};
+
 // Inputs are a single coherent anchor snapshot taken under the clock mutex.
 // Caller provides a fresh zero-initialized row. Unknown UTC stays null.
 inline void apply_clock(Sample &row, std::int64_t now, std::int64_t mono_anchor,
-                        std::int64_t utc_anchor, std::int32_t generation) {
-  row.integer(clock_status, generation ? 1 : 0);
+                        std::int64_t utc_anchor, std::int32_t generation,
+                        std::int32_t source = kClockHost) {
+  row.integer(clock_status, generation ? source : kClockNone);
   row.integer(clock_epoch, generation);
   if (generation) {
     row.counter(event_time_utc_ns, utc_anchor + (now - mono_anchor) * 1000);

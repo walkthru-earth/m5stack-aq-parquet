@@ -108,6 +108,12 @@ char station_text[37]{};
 portMUX_TYPE clock_mutex = portMUX_INITIALIZER_UNLOCKED;
 std::int64_t anchor_mono_us = 0, anchor_utc_ns = 0;
 std::int32_t clock_generation = 0;
+std::int32_t clock_source = kClockNone;
+// A host sync asks the main task (the only task that talks to the internal
+// I2C bus after startup) to copy the anchor into the BM8563 RTC.
+std::atomic<bool> rtc_write_pending{false};
+std::atomic<std::int64_t> rtc_write_requested_us{0};
+std::atomic<std::int32_t> rtc_state{0}; // 0 unread, 1 seeded, 2 unusable
 bool mounted = false;
 bool accepting = false;
 Codec selected_codec = Codec::Uncompressed;
@@ -455,8 +461,8 @@ bool finalize_file(OutputFile &target) {
        target.benchmark ? "codec-comparison-duplicate-rows" : "telemetry"},
       {"board", "CoreS3 ESP32-S3 rev0.2"},
       {"sample_interval_ms", "10000"},
-      {"clock", "0=unsynchronized/null,1=host estimate; RTC calendar "
-                "untrusted; partitions UTC"},
+      {"clock", "0=unsynchronized/null,1=host estimate,2=restored from RTC "
+                "(earlier host estimate, whole seconds); partitions UTC"},
       {"pms_status", "0=missing,1=warming,2=stale,3=sensor-error,4=valid"},
       {"light_status",
        "0=unavailable,1=not-fresh,2=invalid,3=valid,4=io-error"},
@@ -728,31 +734,175 @@ void send_file(const char *name) {
                static_cast<unsigned long>(expected_crc));
 }
 
-// Shared by `parquet time` and the BLE SET_TIME op. False for a bad epoch.
-bool set_clock(std::int64_t seconds, std::int64_t mono) {
+const char *clock_source_name(std::int32_t source) {
+  switch (source) {
+  case kClockHost:
+    return "host";
+  case kClockRtc:
+    return "rtc";
+  default:
+    return "none";
+  }
+}
+
+// Shared by `parquet time`, the BLE/LAN SET_TIME op and the boot-time RTC
+// seed. False for a bad epoch (before 2020 or after 2100, which also rejects
+// an RTC that was never written). Each call starts a new clock epoch; rows
+// already captured keep theirs. When an anchor already existed, `skew_ns`
+// receives new minus old estimate of the same monotonic instant, i.e. how far
+// the previous clock (RTC or earlier host) had drifted from this host.
+bool set_clock(std::int64_t seconds, std::int64_t mono, std::int32_t source,
+               std::int64_t *skew_ns = nullptr,
+               std::int32_t *previous = nullptr) {
   if (seconds < 1577836800LL || seconds > 4102444800LL)
     return false;
+  const std::int64_t utc_ns = seconds * 1000000000;
   portENTER_CRITICAL(&clock_mutex);
+  if (previous)
+    *previous = clock_generation ? clock_source : kClockNone;
+  if (skew_ns)
+    *skew_ns = clock_generation
+                   ? utc_ns - (anchor_utc_ns + (mono - anchor_mono_us) * 1000)
+                   : 0;
   anchor_mono_us = mono;
-  anchor_utc_ns = seconds * 1000000000;
+  anchor_utc_ns = utc_ns;
+  clock_source = source;
   ++clock_generation;
   portEXIT_CRITICAL(&clock_mutex);
+  if (source == kClockHost) {
+    rtc_write_requested_us = mono;
+    rtc_write_pending = true;
+  }
   return true;
+}
+
+// Reports a host sync on serial: the anchor line the host tools parse, then
+// the drift of whatever clock was in use before (RTC-restored or an earlier
+// host value), which is the only clock-accuracy evidence this device has.
+void report_host_clock(const char *transport, std::int64_t seconds,
+                       std::int64_t mono, std::int32_t previous,
+                       std::int64_t skew_ns) {
+  aqlog.printf("PARQUET TIME epoch_s=%lld source=host monotonic_us=%lld\n",
+               static_cast<long long>(seconds), static_cast<long long>(mono));
+  if (previous != kClockNone)
+    aqlog.printf("PARQUET CLOCK transport=%s previous=%s skew_ms=%lld\n",
+                 transport, clock_source_name(previous),
+                 static_cast<long long>(skew_ns / 1000000));
+}
+
+// Days since 1970-01-01 for a proleptic Gregorian date (Howard Hinnant's
+// days_from_civil); avoids mktime/timegm and the process TZ entirely.
+std::int64_t days_from_civil(int year, unsigned month, unsigned day) {
+  year -= month <= 2;
+  const std::int64_t era = (year >= 0 ? year : year - 399) / 400;
+  const unsigned yoe = static_cast<unsigned>(year - era * 400);
+  const unsigned doy = (153 * (month + (month > 2 ? -3 : 9)) + 2) / 5 + day - 1;
+  const unsigned doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+  return era * 146097 + static_cast<std::int64_t>(doe) - 719468;
+}
+
+// Boot-time seed from the BM8563: used only when the chip reports no
+// voltage-low event since it was last written and the calendar decodes. The
+// chip keeps UTC (never local time), because this device writes it from a UTC
+// anchor and the Hive path contract is UTC.
+void seed_clock_from_rtc() {
+  if (!M5.Rtc.isEnabled()) {
+    rtc_state = 2;
+    aqlog.println("PARQUET RTC state=absent");
+    return;
+  }
+  if (M5.Rtc.getVoltLow()) {
+    rtc_state = 2;
+    aqlog.println("PARQUET RTC state=unusable reason=voltage-low");
+    return;
+  }
+  m5::rtc_datetime_t rtc{};
+  if (!M5.Rtc.getDateTime(&rtc)) {
+    rtc_state = 2;
+    aqlog.println("PARQUET RTC state=unusable reason=invalid-calendar");
+    return;
+  }
+  const std::int64_t seconds =
+      days_from_civil(rtc.date.year, static_cast<unsigned>(rtc.date.month),
+                      static_cast<unsigned>(rtc.date.date)) *
+          86400 +
+      rtc.time.hours * 3600 + rtc.time.minutes * 60 + rtc.time.seconds;
+  const auto mono = esp_timer_get_time();
+  if (!set_clock(seconds, mono, kClockRtc)) {
+    rtc_state = 2;
+    aqlog.printf("PARQUET RTC state=unusable reason=out-of-range "
+                 "date=%04d-%02d-%02d\n",
+                 rtc.date.year, rtc.date.month, rtc.date.date);
+    return;
+  }
+  rtc_state = 1;
+  aqlog.printf("PARQUET TIME epoch_s=%lld source=rtc monotonic_us=%lld\n",
+               static_cast<long long>(seconds), static_cast<long long>(mono));
+}
+
+// Main-task half of a host sync: copies the anchor into the RTC. The chip
+// stores whole seconds, so the write waits for the anchor's next second
+// boundary (the 20 ms loop makes a 60 ms window reliable) and gives up
+// waiting after 5 s so a slow loop cannot postpone it forever.
+void service_rtc_write(std::int64_t now) {
+  if (!rtc_write_pending.load())
+    return;
+  std::int64_t utc_anchor, mono_anchor;
+  portENTER_CRITICAL(&clock_mutex);
+  utc_anchor = anchor_utc_ns;
+  mono_anchor = anchor_mono_us;
+  portEXIT_CRITICAL(&clock_mutex);
+  const std::int64_t utc_ns = utc_anchor + (now - mono_anchor) * 1000;
+  const std::int64_t fraction_ns = utc_ns % 1000000000;
+  const bool overdue = now - rtc_write_requested_us.load() > 5000000LL;
+  if (fraction_ns >= 60000000LL && !overdue)
+    return;
+  rtc_write_pending = false;
+  if (!M5.Rtc.isEnabled()) {
+    aqlog.println("PARQUET RTC write=skipped reason=absent");
+    return;
+  }
+  // Round to the nearest second when writing late.
+  const std::time_t seconds =
+      static_cast<std::time_t>((utc_ns + 500000000) / 1000000000);
+  std::tm utc{};
+  if (!::gmtime_r(&seconds, &utc)) {
+    aqlog.println("PARQUET RTC write=failed reason=gmtime");
+    return;
+  }
+  const m5::rtc_datetime_t value(utc);
+  M5.Rtc.setDateTime(value);
+  m5::rtc_datetime_t readback{};
+  const bool ok = M5.Rtc.getDateTime(&readback) &&
+                  readback.date.year == value.date.year &&
+                  readback.date.month == value.date.month &&
+                  readback.date.date == value.date.date &&
+                  readback.time.hours == value.time.hours &&
+                  readback.time.minutes == value.time.minutes;
+  rtc_state = ok ? 1 : 2;
+  aqlog.printf("PARQUET RTC write=%s utc=%04d-%02d-%02dT%02d:%02d:%02dZ "
+               "late_ms=%lld%s\n",
+               ok ? "ok" : "readback-mismatch", utc.tm_year + 1900,
+               utc.tm_mon + 1, utc.tm_mday, utc.tm_hour, utc.tm_min, utc.tm_sec,
+               static_cast<long long>(fraction_ns / 1000000),
+               overdue ? " overdue=true" : "");
 }
 
 // ---- BLE `status` document and control handlers (docs/ble-sync-protocol.md)
 
 std::size_t build_status_json(char *out, std::size_t size) {
-  std::int32_t generation;
+  std::int32_t generation, source;
   portENTER_CRITICAL(&clock_mutex);
   generation = clock_generation;
+  source = clock_source;
   portEXIT_CRITICAL(&clock_mutex);
   const int written = std::snprintf(
       out, size,
       "{\"up_s\":%lu,\"int_s\":%lu,\"buf\":%lu,\"fin\":%lu,\"drop\":%lu,"
       "\"err\":%lu,\"miss\":%lld,\"fail\":%u,\"codec\":\"%s\",\"utc\":%u,"
-      "\"gen\":%ld,\"sd\":%u,\"sd_kib\":%lu,\"sd_used_kib\":%lu,\"heap\":%lu,"
-      "\"part\":%lu,\"open\":%lu,\"open_rg\":%lu}",
+      "\"gen\":%ld,\"clk\":%ld,\"rtc\":%ld,\"sd\":%u,\"sd_kib\":%lu,"
+      "\"sd_used_kib\":%lu,\"heap\":%lu,\"part\":%lu,\"open\":%lu,"
+      "\"open_rg\":%lu}",
       static_cast<unsigned long>(esp_timer_get_time() / 1000000),
       static_cast<unsigned long>(rotation_seconds.load()),
       static_cast<unsigned long>(buffered.load()),
@@ -762,7 +912,9 @@ std::size_t build_status_json(char *out, std::size_t size) {
       static_cast<long long>(missed_deadlines.load()),
       worker_failed.load() ? 1U : 0U, codec_name(selected_codec),
       generation ? 1U : 0U, static_cast<long>(generation),
-      storage_ok.load() ? 1U : 0U, static_cast<unsigned long>(total_kib.load()),
+      static_cast<long>(generation ? source : kClockNone),
+      static_cast<long>(rtc_state.load()), storage_ok.load() ? 1U : 0U,
+      static_cast<unsigned long>(total_kib.load()),
       static_cast<unsigned long>(used_kib.load()),
       static_cast<unsigned long>(ESP.getFreeHeap()),
       static_cast<unsigned long>(partials_seen.load()),
@@ -1198,13 +1350,15 @@ void handle_control_request(const ble::ControlRequest &request,
       return;
     }
     const std::int64_t seconds = get_i64(body);
-    if (!set_clock(seconds, request.received_mono_us)) {
+    std::int64_t skew_ns = 0;
+    std::int32_t previous = kClockNone;
+    if (!set_clock(seconds, request.received_mono_us, kClockHost, &skew_ns,
+                   &previous)) {
       respond_error(ble::kOpSetTime, ble::kErrInvalidEpoch, nullptr);
       return;
     }
-    aqlog.printf("PARQUET TIME epoch_s=%lld source=ble monotonic_us=%lld\n",
-                 static_cast<long long>(seconds),
-                 static_cast<long long>(request.received_mono_us));
+    report_host_clock(request.link == ble::Link::Ble ? "ble" : "lan", seconds,
+                      request.received_mono_us, previous, skew_ns);
     std::uint8_t frame[17];
     frame[0] = ble::kFrameTimeSet;
     put_i64(frame + 1, seconds);
@@ -1457,13 +1611,14 @@ void storage_worker(void *) {
       char *end = nullptr;
       const auto seconds = std::strtoll(command.text + 13, &end, 10);
       const auto mono = command.received_mono_us;
-      if (!end || *end || !set_clock(seconds, mono)) {
+      std::int64_t skew_ns = 0;
+      std::int32_t previous = kClockNone;
+      if (!end || *end ||
+          !set_clock(seconds, mono, kClockHost, &skew_ns, &previous)) {
         aqlog.println("PARQUET ERROR operation=time reason=invalid-epoch");
         continue;
       }
-      aqlog.printf("PARQUET TIME epoch_s=%lld source=host monotonic_us=%lld\n",
-                   static_cast<long long>(seconds),
-                   static_cast<long long>(mono));
+      report_host_clock("serial", seconds, mono, previous, skew_ns);
       publish_status();
     } else if (std::strcmp(command.text, "parquet list") == 0)
       list_files();
@@ -1485,13 +1640,14 @@ void collect(const PmsSnapshot &pms, std::int64_t now, std::int64_t scheduled) {
   row.counter(scheduled_us, scheduled);
   row.counter(sample_jitter_us, now - scheduled);
   std::int64_t utc_anchor, mono_anchor;
-  std::int32_t generation;
+  std::int32_t generation, source;
   portENTER_CRITICAL(&clock_mutex);
   utc_anchor = anchor_utc_ns;
   mono_anchor = anchor_mono_us;
   generation = clock_generation;
+  source = clock_source;
   portEXIT_CRITICAL(&clock_mutex);
-  apply_clock(row, now, mono_anchor, utc_anchor, generation);
+  apply_clock(row, now, mono_anchor, utc_anchor, generation, source);
   const int status = !pms.present        ? 0
                      : now < 30000000    ? 1
                      : pms.age_ms > 5000 ? 2
@@ -1657,6 +1813,9 @@ void begin_logger(bool sd_mounted) {
   writer_state->benchmark.staging = staging_benchmark;
   prepare_columns();
   const bool light = light_sensor.begin();
+  // Before the worker starts, so the first row of the boot is already dated
+  // when the RTC holds an earlier host sync.
+  seed_clock_from_rtc();
   next_sample_us = esp_timer_get_time() + kSampleUs;
   if (xTaskCreate(storage_worker, "parquet-sd", 24576, nullptr, 1,
                   &worker_task) != pdPASS) {
@@ -1722,6 +1881,7 @@ void poll_logger(const PmsSnapshot &pms) {
     collect(pms, now, next_sample_us);
     next_sample_us += kSampleUs;
   }
+  service_rtc_write(esp_timer_get_time());
   static Command input{};
   static std::size_t length = 0;
   static bool overflow = false;
@@ -1785,4 +1945,23 @@ bool enqueue_request(const ble::ControlRequest &request) {
 const char *station_text_id() { return station_text; }
 const char *device_text_id() { return device_text; }
 const char *firmware_text_id() { return kFirmware; }
+
+ClockView clock_view() {
+  ClockView view{};
+  std::int64_t utc_anchor, mono_anchor;
+  std::int32_t generation, source;
+  portENTER_CRITICAL(&clock_mutex);
+  utc_anchor = anchor_utc_ns;
+  mono_anchor = anchor_mono_us;
+  generation = clock_generation;
+  source = clock_source;
+  portEXIT_CRITICAL(&clock_mutex);
+  view.epoch = generation;
+  view.source = generation ? source : kClockNone;
+  view.source_name = clock_source_name(view.source);
+  view.rtc_state = rtc_state.load();
+  if (generation)
+    view.utc_ns = utc_anchor + (esp_timer_get_time() - mono_anchor) * 1000;
+  return view;
+}
 } // namespace telemetry

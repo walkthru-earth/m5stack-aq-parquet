@@ -20,6 +20,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
+#include <ctime>
 #include <numeric>
 
 namespace {
@@ -652,6 +653,22 @@ void draw_device_page() {
   M5.Display.printf("Touch: %s  refresh: %lu s",
                     M5.Touch.isEnabled() ? "enabled" : "disabled",
                     static_cast<unsigned long>(kDisplayIntervalMs / 1000));
+  // UTC by contract; the phone renders local time.
+  const auto clock = telemetry::clock_view();
+  M5.Display.setCursor(8, 211);
+  if (clock.source == 0) {
+    M5.Display.printf("Clock: no UTC yet (RTC %s), set from app",
+                      clock.rtc_state == 2 ? "unusable" : "unset");
+  } else {
+    const std::time_t seconds =
+        static_cast<std::time_t>(clock.utc_ns / 1000000000);
+    std::tm utc{};
+    if (::gmtime_r(&seconds, &utc))
+      M5.Display.printf("Clock: %04d-%02d-%02d %02d:%02d:%02dZ %s e%ld",
+                        utc.tm_year + 1900, utc.tm_mon + 1, utc.tm_mday,
+                        utc.tm_hour, utc.tm_min, utc.tm_sec, clock.source_name,
+                        static_cast<long>(clock.epoch));
+  }
 }
 
 void draw_bluetooth_page() {

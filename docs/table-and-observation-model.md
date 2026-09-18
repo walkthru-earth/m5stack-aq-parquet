@@ -125,7 +125,7 @@ The clock anchor pair in each row supports auditing the UTC mapping without rely
 | Validity token | Meaning in this implementation |
 | --- | --- |
 | `always` | Populated logger/API status or counter; presence does not establish physical accuracy |
-| `clock_anchored` | Host anchor supplied for this row's clock epoch; otherwise null |
+| `clock_anchored` | An anchor exists for this row's clock epoch (host-supplied this boot, `clock_status = 1`, or RTC-restored from an earlier host sync, `clock_status = 2`); otherwise null |
 | `pms_present` | At least one checksum-valid frame received this boot, including stale/error-bearing frames |
 | `pms_valid` | `pms_status=4`: present, beyond boot warm-up, within stale threshold, sensor error zero |
 | `accel_fresh_finite`, `gyro_fresh_finite` | Corresponding M5 IMU fresh bit and finite value |
@@ -134,7 +134,7 @@ The clock anchor pair in each row supports auditing the UTC mapping without rely
 | `light_valid`, `proximity_valid` | LTR driver validity booleans after fresh read and channel checks; status also reports shared I/O errors |
 | `api_report_unqualified` | M5 API report; not independent proof of battery presence, power flow or accuracy |
 | `battery_range_0_100` | API result within 0–100; battery presence remains unqualified |
-| `rtc_read_ok` | Successful RTC API read; not a trusted UTC source |
+| `rtc_read_ok` | Successful RTC API read of the BM8563 calendar as a diagnostic column (`rtc_date_yyyymmdd`, `rtc_time_hhmmss`, UTC). The row's `event_time_utc_ns` never comes from this read; the RTC feeds the clock only through the boot-time seed recorded as `clock_status = 2` |
 | `touch_present` | Nonzero touch count; first reported point |
 | `sd_mounted_cached` | Startup mount succeeded; size values are cached KiB-resolution reports, not hotplug proof |
 | `unavailable` | Intentionally null: unsupported battery current or unresolved SHT20 isolation |

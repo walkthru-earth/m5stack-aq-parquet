@@ -68,8 +68,9 @@ Notified after every stored sample (every 10 s) and after any `control` request 
 
 ```json
 {"up_s":12345,"int_s":900,"buf":12,"fin":764,"drop":0,"err":0,"miss":0,
- "fail":0,"codec":"LZ4_RAW","utc":1,"gen":1,"sd":1,"sd_kib":31166976,
- "sd_used_kib":34176,"heap":180000,"part":0,"open":180,"open_rg":2}
+ "fail":0,"codec":"LZ4_RAW","utc":1,"gen":1,"clk":2,"rtc":1,"sd":1,
+ "sd_kib":31166976,"sd_used_kib":34176,"heap":180000,"part":0,"open":180,
+ "open_rg":2}
 ```
 
 | Key | Meaning |
@@ -81,6 +82,7 @@ Notified after every stored sample (every 10 s) and after any `control` request 
 | `fin` / `drop` / `err` / `miss` | same counters as `PARQUET STATUS` and the row fields `files_finalized`, `rows_dropped`, `storage_errors`, `sample_deadlines_missed` |
 | `fail` | 1 when the storage worker has stopped writing after an error |
 | `utc` / `gen` | 1 when a UTC anchor is set; anchor generation (`clock_epoch`) |
+| `clk` / `rtc` | firmware v6.2. `clk` is the anchor source, same codes as `clock_status`: 0 none, 1 host time set on this boot, 2 restored at boot from the RTC (an earlier host sync, whole seconds plus drift). `rtc` is the RTC chip state: 0 not read, 1 in use or written, 2 unusable (absent, voltage-low, invalid calendar). Absent on ≤ v6.1. A phone SHOULD offer "set time" whenever `clk != 1`, not only when `utc == 0`: with `clk == 2` the rows are dated, but nothing has checked that clock against a fresh source since the last sync |
 | `sd` | 1 when the card is mounted and the output directory exists |
 | `part` | retained `.partial` files seen at the last listing |
 
@@ -160,7 +162,7 @@ Rules:
 - **`OPEN`** runs the finalized-file check (magic `PAR1` head and tail, footer length sane) and computes the CRC-32 (IEEE, same as the serial `crc32=` field) over the whole file before answering. At most one file is open per connection; a new `OPEN` implicitly closes the previous one. Handles start at 1 and are invalid after disconnect.
 - **`READ`** is clipped to `max_read` and to end-of-file. Chunks are delivered in offset order; `next_offset` tells the phone where to continue. Offsets are absolute, so a phone can resume after a disconnect by `OPEN` + `READ` from where it stopped, provided `size` and `crc32` in the new `OPENED` frame match the earlier one (the file is immutable, so they must).
 - A file is **complete** only when the phone has `size` bytes, its own CRC-32 equals `OPENED.crc32`, and the head/tail magic is `PAR1`. Anything else is discarded, never presented as data.
-- `SET_TIME` uses the device's monotonic clock at the moment the write arrived, the same way `parquet time` does. Only rows sampled afterwards get UTC; earlier rows stay in the `unsynced` tree by contract. The phone should send its own clock only when it believes it is correct, and should say so in its UI.
+- `SET_TIME` uses the device's monotonic clock at the moment the write arrived, the same way `parquet time` does. Only rows sampled afterwards get UTC; earlier rows stay in the `unsynced` tree by contract. The phone should send its own clock only when it believes it is correct, and should say so in its UI. Since firmware v6.2 the value is also written to the BM8563 RTC (UTC) and restored at the next boot as `clk == 2`, so a `SET_TIME` on a device that already reports `utc == 1` is a legitimate *refresh*: it starts a new epoch, and the device logs the skew of the clock it replaced on serial (`PARQUET CLOCK … skew_ms=…`). The `TIME_SET` frame is unchanged; the skew is not returned over the link yet.
 - `FLUSH` finalizes the RAM batch — and, on firmware v6, any row groups already in the open file — so the phone can pull everything up to now. Use it deliberately (a "sync now" action); it produces a short file and does not change the rotation interval. The `FLUSHED` row count is RAM rows plus rows that were already on the card in the open file.
 
 ## Device configuration (v2)
